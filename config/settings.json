@@ -1,0 +1,43 @@
+{
+  "safety": {
+    "_comment": "이 한도를 넘는 주문/규칙은 실행하지 않고 텔레그램으로 확인을 요청한다. 손절(매도)이 확인 대기로 막히지 않도록 매도 금액 한도는 기본 해제(null).",
+    "max_buy_order_amount": 3000000,
+    "max_sell_order_amount": null,
+    "max_daily_orders": 20,
+    "max_daily_buy_amount": 6000000,
+    "max_change_pct_from_prev_close": 15.0,
+    "max_tick_jump_pct": 5.0,
+    "tick_jump_window_sec": 180,
+    "blocked_status_codes": ["52", "58", "59"],
+    "max_consecutive_api_errors": 3,
+    "blocked_name_keywords": ["레버리지", "인버스", "2X", "3X", "선물", "곱버스", "울트라"]
+  },
+  "engine": {
+    "poll_seconds": 20,
+    "order_type": "market",
+    "session_start": "09:00:30",
+    "session_end": "15:19:30",
+    "build_time": "09:30",
+    "rebalance_time": "10:00",
+    "summary_time": "15:40",
+    "fill_wait_seconds": 6,
+    "over_limit_card_ttl_min": 10
+  },
+  "autoinvest": {
+    "build_tranches": 3,
+    "rebalance_band_pp": 5.0,
+    "min_trade_dev_pp": 1.0,
+    "rebalance_mode": "auto"
+  },
+  "sim": {
+    "initial_cash": 11200000,
+    "initial_holdings": {"000660": {"qty": 20, "avg_price": 190000}},
+    "volatility_pct": 0.15
+  },
+  "holidays": [
+    "2026-01-01", "2026-02-16", "2026-02-17", "2026-02-18", "2026-03-02",
+    "2026-05-01", "2026-05-05", "2026-05-25", "2026-06-03", "2026-08-17",
+    "2026-09-24", "2026-09-25", "2026-10-05", "2026-10-09", "2026-12-25",
+    "2026-12-31", "2027-01-01"
+  ]
+}

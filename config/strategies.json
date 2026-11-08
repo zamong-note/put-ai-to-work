@@ -1,0 +1,64 @@
+{
+  "_comment": "자동 투자는 이 파일에 정의된 후보 목록과 단계별 목표 비중 안에서만 움직인다. LLM은 이 파일을 바꾸지 못한다. 종목코드는 운영 전 HTS/MTS에서 한 번 더 확인할 것.",
+  "categories": {
+    "domestic_index": "국내 지수 ETF",
+    "us_index": "미국 지수 ETF",
+    "bond": "채권 ETF",
+    "cash_like": "예금성 ETF",
+    "dividend": "배당 ETF",
+    "sector": "섹터 ETF",
+    "large_cap": "우량 대형주",
+    "growth": "대형·성장주"
+  },
+  "universe": {
+    "069500": {"name": "KODEX 200", "category": "domestic_index", "kind": "ETF"},
+    "360750": {"name": "TIGER 미국S&P500", "category": "us_index", "kind": "ETF"},
+    "133690": {"name": "TIGER 미국나스닥100", "category": "us_index", "kind": "ETF"},
+    "114260": {"name": "KODEX 국고채3년", "category": "bond", "kind": "ETF"},
+    "153130": {"name": "KODEX 단기채권", "category": "bond", "kind": "ETF"},
+    "459580": {"name": "KODEX CD금리액티브(합성)", "category": "cash_like", "kind": "ETF"},
+    "279530": {"name": "KODEX 고배당주", "category": "dividend", "kind": "ETF"},
+    "091160": {"name": "KODEX 반도체", "category": "sector", "kind": "ETF"},
+    "266420": {"name": "KODEX 헬스케어", "category": "sector", "kind": "ETF"},
+    "005930": {"name": "삼성전자", "category": "large_cap", "kind": "STOCK"},
+    "000660": {"name": "SK하이닉스", "category": "large_cap", "kind": "STOCK"},
+    "005380": {"name": "현대차", "category": "large_cap", "kind": "STOCK"},
+    "105560": {"name": "KB금융", "category": "large_cap", "kind": "STOCK"},
+    "035420": {"name": "NAVER", "category": "large_cap", "kind": "STOCK"},
+    "373220": {"name": "LG에너지솔루션", "category": "growth", "kind": "STOCK"},
+    "207940": {"name": "삼성바이오로직스", "category": "growth", "kind": "STOCK"},
+    "012450": {"name": "한화에어로스페이스", "category": "growth", "kind": "STOCK"}
+  },
+  "tiers": {
+    "1": {
+      "label": "안정",
+      "loss_limit_pct": 3,
+      "summary": "채권·예금성 ETF 80%, 지수 ETF 20%",
+      "targets": {"459580": 40, "153130": 20, "114260": 20, "069500": 10, "360750": 10}
+    },
+    "2": {
+      "label": "안정추구",
+      "loss_limit_pct": 5,
+      "summary": "채권 ETF 50%, 지수·배당 ETF 50%",
+      "targets": {"114260": 25, "153130": 25, "069500": 20, "360750": 15, "279530": 15}
+    },
+    "3": {
+      "label": "중립",
+      "loss_limit_pct": 10,
+      "summary": "지수 ETF 60%, 채권·배당 ETF 40%",
+      "targets": {"069500": 40, "360750": 20, "114260": 25, "279530": 15}
+    },
+    "4": {
+      "label": "적극",
+      "loss_limit_pct": 15,
+      "summary": "지수 ETF 50%, 우량 대형주 50%",
+      "targets": {"069500": 25, "360750": 15, "133690": 10, "005930": 15, "000660": 10, "005380": 10, "105560": 8, "035420": 7}
+    },
+    "5": {
+      "label": "공격",
+      "loss_limit_pct": 20,
+      "summary": "대형·성장주 70%, 섹터 ETF 30%",
+      "targets": {"005930": 15, "000660": 15, "373220": 10, "207940": 10, "012450": 10, "035420": 10, "091160": 15, "266420": 15}
+    }
+  }
+}

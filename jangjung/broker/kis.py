@@ -1,0 +1,186 @@
+"""한국투자증권 KIS Open API — 모의투자 전용 클라이언트.
+
+이번 챌린지는 모의투자 계좌로만 운영하므로 실전 도메인은 코드에 넣지 않았다.
+참고: https://apiportal.koreainvestment.com , https://github.com/koreainvestment/open-trading-api
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import httpx
+
+from .. import timeutil
+from .base import Account, BrokerError, BrokerNetworkError, BrokerRejected, FillStatus, Holding, OrderResult, Quote
+
+MOCK_BASE = "https://openapivts.koreainvestment.com:29443"
+
+TR = {
+    "price": "FHKST01010100",        # 주식현재가 시세
+    "buy": "VTTC0012U",              # 모의 현금 매수 (구 VTTC0802U)
+    "sell": "VTTC0011U",             # 모의 현금 매도 (구 VTTC0801U)
+    "balance": "VTTC8434R",          # 모의 잔고조회
+    "ccld": ["VTTC0081R", "VTTC8001R"],  # 모의 일별주문체결조회 (신/구)
+}
+LEGACY_ORDER_TR = {"buy": "VTTC0802U", "sell": "VTTC0801U"}
+TOKEN_ERRORS = {"EGW00123", "EGW00121"}
+
+
+class KISBroker:
+    name = "kis-mock"
+
+    def __init__(self, app_key: str, app_secret: str, account: str, product: str, data_dir: Path,
+                 min_interval: float = 0.6):
+        if not (app_key and app_secret and account):
+            raise BrokerError("KIS_APP_KEY / KIS_APP_SECRET / KIS_ACCOUNT 가 .env 에 없습니다")
+        self.app_key, self.app_secret = app_key, app_secret
+        self.cano, self.prdt = account[:8], product
+        self.token_path = data_dir / "kis_token.json"
+        self.http = httpx.AsyncClient(base_url=MOCK_BASE, timeout=10)
+        self._lock = asyncio.Lock()
+        self._last = 0.0
+        self._min_interval = min_interval  # 모의투자 초당 호출 제한 대응
+        self._token: str | None = None
+        self._token_exp: datetime | None = None
+        self._ccld_tr = TR["ccld"][0]
+
+    # ── 인증 ──
+    async def _get_token(self, force: bool = False) -> str:
+        now = datetime.now()
+        if not force and self._token and self._token_exp and now < self._token_exp:
+            return self._token
+        if not force and self.token_path.exists():
+            d = json.loads(self.token_path.read_text(encoding="utf-8"))
+            exp = datetime.fromisoformat(d["exp"])
+            if d.get("app_key") == self.app_key[:6] and now < exp:
+                self._token, self._token_exp = d["token"], exp
+                return self._token
+        r = await self.http.post("/oauth2/tokenP", json={
+            "grant_type": "client_credentials", "appkey": self.app_key, "appsecret": self.app_secret})
+        d = r.json()
+        if "access_token" not in d:
+            raise BrokerError(f"토큰 발급 실패: {d.get('error_description') or d}")
+        self._token = d["access_token"]
+        self._token_exp = now + timedelta(seconds=int(d.get("expires_in", 86400)) - 600)
+        self.token_path.write_text(json.dumps({"token": self._token, "exp": self._token_exp.isoformat(),
+                                               "app_key": self.app_key[:6]}), encoding="utf-8")
+        return self._token
+
+    async def _call(self, method: str, path: str, tr_id: str, params: dict | None = None,
+                    body: dict | None = None, tr_cont: str = "", _retry: bool = True) -> tuple[dict, dict]:
+        async with self._lock:
+            wait = self._min_interval - (time.monotonic() - self._last)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            token = await self._get_token()
+            headers = {
+                "content-type": "application/json; charset=utf-8", "authorization": f"Bearer {token}",
+                "appkey": self.app_key, "appsecret": self.app_secret, "tr_id": tr_id, "custtype": "P",
+                "tr_cont": tr_cont,
+            }
+            try:
+                r = await self.http.request(method, path, params=params, json=body, headers=headers)
+            except httpx.HTTPError as e:
+                raise BrokerNetworkError(f"네트워크 오류: {e}") from e
+            finally:
+                self._last = time.monotonic()
+        try:
+            d = r.json()
+        except ValueError as e:
+            raise BrokerError(f"HTTP {r.status_code} 응답 파싱 실패") from e
+        if d.get("msg_cd") in TOKEN_ERRORS and _retry:
+            await self._get_token(force=True)
+            return await self._call(method, path, tr_id, params, body, tr_cont, _retry=False)
+        if d.get("rt_cd") != "0":
+            raise BrokerRejected(f"[{d.get('msg_cd')}] {d.get('msg1', '').strip()} (tr={tr_id})")
+        return d, dict(r.headers)
+
+    # ── 시세 ──
+    async def get_quote(self, symbol: str) -> Quote:
+        d, _ = await self._call("GET", "/uapi/domestic-stock/v1/quotations/inquire-price", TR["price"],
+                                params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol})
+        o = d.get("output") or {}
+        price = float(o.get("stck_prpr") or 0)
+        if price <= 0:
+            raise BrokerError(f"{symbol} 현재가 0 — 시세 이상")
+        prev = float(o.get("stck_sdpr") or 0) or price
+        status = str(o.get("iscd_stat_cls_code") or "00")
+        halted = str(o.get("temp_stop_yn", "N")).upper() == "Y" or status == "58"
+        return Quote(symbol, price, prev, float(o.get("prdy_ctrt") or 0), halted, status, timeutil.now())
+
+    # ── 잔고 ──
+    async def get_account(self) -> Account:
+        params = {"CANO": self.cano, "ACNT_PRDT_CD": self.prdt, "AFHR_FLPR_YN": "N", "OFL_YN": "",
+                  "INQR_DVSN": "02", "UNPR_DVSN": "01", "FUND_STTL_ICLD_YN": "N", "FNCG_AMT_AUTO_RDPT_YN": "N",
+                  "PRCS_DVSN": "00", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
+        holdings: dict[str, Holding] = {}
+        summary: dict = {}
+        tr_cont = ""
+        for _ in range(10):
+            d, h = await self._call("GET", "/uapi/domestic-stock/v1/trading/inquire-balance", TR["balance"],
+                                    params=params, tr_cont=tr_cont)
+            for row in d.get("output1") or []:
+                qty = int(float(row.get("hldg_qty") or 0))
+                if qty > 0:
+                    sym = row["pdno"]
+                    holdings[sym] = Holding(sym, row.get("prdt_name", sym), qty,
+                                            float(row.get("pchs_avg_pric") or 0), float(row.get("prpr") or 0))
+            out2 = d.get("output2") or [{}]
+            summary = out2[0] if isinstance(out2, list) else out2
+            if h.get("tr_cont") in ("F", "M"):
+                params["CTX_AREA_FK100"] = d.get("ctx_area_fk100", "")
+                params["CTX_AREA_NK100"] = d.get("ctx_area_nk100", "")
+                tr_cont = "N"
+            else:
+                break
+        # D+2 예수금(가수도정산금액)을 주문 가능 현금의 근사로 사용
+        cash = float(summary.get("prvs_rcdl_excc_amt") or summary.get("dnca_tot_amt") or 0)
+        return Account(cash, holdings, float(summary.get("tot_evlu_amt") or 0))
+
+    # ── 주문 ──
+    async def place_order(self, symbol, side, qty, order_type, price) -> OrderResult:
+        body = {"CANO": self.cano, "ACNT_PRDT_CD": self.prdt, "PDNO": symbol,
+                "ORD_DVSN": "01" if order_type == "market" else "00",
+                "ORD_QTY": str(int(qty)), "ORD_UNPR": "0" if order_type == "market" else str(int(price)),
+                "EXCG_ID_DVSN_CD": "KRX"}
+        if side == "sell":
+            body["SLL_TYPE"] = "01"
+        try:
+            d, _ = await self._call("POST", "/uapi/domestic-stock/v1/trading/order-cash", TR[side], body=body)
+        except BrokerRejected as e:
+            # API가 명시적으로 거절한 경우에만(접수 안 됨이 확실) 구 TR로 한 번 재시도.
+            # 네트워크 오류(BrokerNetworkError)는 접수 여부를 알 수 없으므로 재시도하지 않는다 → 이중주문 방지
+            if not any(k in str(e) for k in ("TR", "tr_id", "EGW0")):
+                raise
+            d, _ = await self._call("POST", "/uapi/domestic-stock/v1/trading/order-cash",
+                                    LEGACY_ORDER_TR[side], body=body)
+        o = d.get("output") or {}
+        return OrderResult(True, str(o.get("ODNO") or o.get("odno") or ""), d.get("msg1", "").strip())
+
+    async def get_fill(self, order_no: str, symbol: str) -> FillStatus:
+        day = timeutil.now().strftime("%Y%m%d")
+        params = {"CANO": self.cano, "ACNT_PRDT_CD": self.prdt, "INQR_STRT_DT": day, "INQR_END_DT": day,
+                  "SLL_BUY_DVSN_CD": "00", "INQR_DVSN": "00", "PDNO": symbol, "CCLD_DVSN": "00",
+                  "ORD_GNO_BRNO": "", "ODNO": order_no, "INQR_DVSN_3": "00", "INQR_DVSN_1": "",
+                  "EXCG_ID_DVSN_CD": "KRX", "CTX_AREA_FK100": "", "CTX_AREA_NK100": ""}
+        try:
+            d, _ = await self._call("GET", "/uapi/domestic-stock/v1/trading/inquire-daily-ccld", self._ccld_tr,
+                                    params=params)
+        except BrokerError:
+            if self._ccld_tr == TR["ccld"][1]:
+                raise
+            self._ccld_tr = TR["ccld"][1]
+            d, _ = await self._call("GET", "/uapi/domestic-stock/v1/trading/inquire-daily-ccld", self._ccld_tr,
+                                    params=params)
+        for row in d.get("output1") or []:
+            if str(row.get("odno", "")).lstrip("0") == str(order_no).lstrip("0"):
+                filled = int(float(row.get("tot_ccld_qty") or 0))
+                avg = float(row.get("avg_prvs") or 0) or None
+                return FillStatus(order_no, filled, avg, int(float(row.get("rmn_qty") or 0)))
+        return FillStatus(order_no, 0, None, -1)
+
+    async def close(self):
+        await self.http.aclose()

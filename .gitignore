@@ -1,0 +1,48 @@
+# ── 비밀값: 절대 커밋 금지 ──
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+# Google 서비스 계정 키 등 자격증명 JSON
+*service-account*.json
+*service_account*.json
+*credentials*.json
+client_secret*.json
+kis_token.json
+
+# ── 실행 중 생성되는 데이터 (계좌·매매내역·토큰 포함) ──
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+journal_*.csv
+sim_overrides.json
+stock_master.json
+*.log
+logs/
+
+# ── Python / uv ──
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── 에디터 / OS / 로컬 에이전트 설정 ──
+.vscode/
+.idea/
+.claude/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

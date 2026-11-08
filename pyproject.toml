@@ -1,0 +1,28 @@
+[project]
+name = "jangjung"
+version = "0.1.0"
+description = "장중대리 — 직장인 규칙 매매 + 위험 단계별 자동 투자 에이전트 (KIS 모의투자)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "claude-agent-sdk>=0.2.179",
+    "google-auth>=2.62.1",
+    "gspread>=6.2.1",
+    "httpx>=0.28.1",
+    "python-dotenv>=1.2.4",
+    "starlette>=1.0",
+    "uvicorn>=0.30",
+    "tzdata>=2026.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_default_fixture_loop_scope = "function"
