@@ -13,6 +13,7 @@ import re
 from datetime import date
 from pathlib import Path
 
+from . import timeutil
 from .config import ROOT
 
 REQUIRED_KEYWORDS = ["레버리지", "인버스"]          # 범위 관리: 절대 해제 불가
@@ -64,15 +65,42 @@ SCHEMA: dict[str, list[dict]] = {
         dict(key="min_trade_dev_pp", label="조정 최소 차이", type="float", unit="%p", min=0, max=10, step=0.5,
              help="리밸런싱 때 이보다 작게 벗어난 종목은 건드리지 않음"),
     ],
+    "report": [
+        dict(key="email_daily", label="일간 보고서", type="enum", options={"on": "받음", "off": "안 받음"},
+             help="거래일마다"),
+        dict(key="email_weekly", label="주간 보고서", type="enum", options={"on": "받음", "off": "안 받음"},
+             help="그 주 마지막 거래일"),
+        dict(key="email_monthly", label="월간 보고서", type="enum", options={"on": "받음", "off": "안 받음"},
+             help="그 달 마지막 거래일 · 세 가지를 모두 켜면 해당 날에 모두 받습니다"),
+        dict(key="channel", label="받는 곳", type="enum",
+             options={"both": "메일 + 텔레그램", "email": "메일", "telegram": "텔레그램"},
+             help="연결된 곳으로만 보냅니다 (메일 = 연결 설정의 SMTP, 텔레그램 = 봇)"),
+        dict(key="send_time", label="보내는 시각", type="time", min="15:30:00", max="23:59:00",
+             help="장 마감 요약 뒤에 보냅니다 (그날 받을 보고서를 한 번에)"),
+    ],
+    "notify": [
+        dict(key="fill", label="체결 알림", type="enum", options={"on": "받음", "off": "안 받음"},
+             help="주문 실패·거부 알림은 끌 수 없습니다"),
+        dict(key="auto", label="자동 투자 알림", type="enum", options={"on": "받음", "off": "안 받음"},
+             help="분할 매수 회차·리밸런싱 결과"),
+        dict(key="summary", label="장 마감 요약", type="enum", options={"on": "받음", "off": "안 받음"}),
+        dict(key="settings", label="설정 변경 알림", type="enum", options={"on": "받음", "off": "안 받음"}),
+        dict(key="report", label="보고서 발송 완료 알림", type="enum", options={"on": "받음", "off": "안 받음"},
+             help="발송 실패 알림은 끌 수 없습니다"),
+    ],
 }
-SECTION_LABEL = {"safety": "안전 한도", "engine": "운영 일정", "autoinvest": "자동 투자", "holidays": "휴장일"}
+SECTION_LABEL = {"safety": "안전 한도", "engine": "운영 일정", "autoinvest": "자동 투자", "report": "보고서",
+                 "notify": "알림", "holidays": "휴장일"}
+NOTIFY_ALIASES = {"체결": "fill", "자동투자": "auto", "자동": "auto", "요약": "summary", "마감": "summary",
+                  "설정": "settings", "보고서": "report"}
+BACKUP_SECTIONS = ("safety", "engine", "autoinvest", "report", "notify")
 
 # .env: (키, 라벨, 종류, 적용 시점)
 ENV_SCHEMA = [
     dict(key="BROKER", label="브로커", kind="enum", options={"sim": "시뮬레이터 (가상 계좌)", "kis": "KIS 모의투자"}, live=False),
     dict(key="KIS_APP_KEY", label="KIS 앱키", kind="secret", live=False),
     dict(key="KIS_APP_SECRET", label="KIS 앱시크릿", kind="secret", live=False),
-    dict(key="KIS_ACCOUNT", label="모의투자 계좌번호 (앞 8자리)", kind="account", live=False),
+    dict(key="KIS_ACCOUNT", label="계좌번호 (앞 8자리)", kind="account", live=False),
     dict(key="KIS_ACCOUNT_PRODUCT", label="계좌 상품코드", kind="text", live=False, pattern=r"^\d{2}$"),
     dict(key="TELEGRAM_BOT_TOKEN", label="텔레그램 봇 토큰", kind="secret", live=False),
     dict(key="TELEGRAM_CHAT_ID", label="텔레그램 chat_id", kind="text", live=True, pattern=r"^-?\d{3,20}$"),
@@ -82,8 +110,18 @@ ENV_SCHEMA = [
          options=["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]),
     dict(key="ANTHROPIC_API_KEY", label="Anthropic API 키 (비우면 Claude Code 로그인)", kind="secret", live=True),
     dict(key="DASHBOARD_PIN", label="휴대폰 접속 PIN (6~12자리 숫자)", kind="secret", live=False, pattern=r"^\d{6,12}$"),
+    dict(key="SMTP_HOST", label="메일 서버 (예: smtp.gmail.com)", kind="text", live=True,
+         pattern=r"^[A-Za-z0-9.\-]{3,100}$"),
+    dict(key="SMTP_PORT", label="메일 포트 (587 STARTTLS / 465 SSL)", kind="text", live=True, pattern=r"^\d{2,5}$"),
+    dict(key="SMTP_USER", label="보내는 메일 계정", kind="text", live=True, pattern=r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+$"),
+    dict(key="SMTP_PASSWORD", label="메일 비밀번호 (Gmail은 앱 비밀번호)", kind="secret", live=True),
+    dict(key="REPORT_EMAIL_TO", label="보고서 받을 주소 (비우면 보내는 계정, 쉼표로 3개까지)", kind="text", live=True,
+         pattern=r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+(\s*,\s*[^@\s,]+@[^@\s,]+\.[^@\s,]+){0,2}$"),
 ]
 ENV_PATH = ROOT / ".env"
+# 백업 파일에 넣는 연결 설정 (비밀값·계좌번호·브로커 종류 제외)
+ENV_BACKUP = ["KIS_ACCOUNT_PRODUCT", "TELEGRAM_CHAT_ID", "GOOGLE_SERVICE_ACCOUNT_FILE", "GOOGLE_SHEET_ID", "CLAUDE_MODEL",
+              "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "REPORT_EMAIL_TO"]
 
 
 class SettingsError(ValueError):
@@ -192,21 +230,19 @@ class SettingsStore:
                 row["value"] = (v[:4] + "****") if v else ""
             else:
                 row["value"] = v
+            if f["key"] == "BROKER" and v == "kis_real":
+                row["locked"] = "실전 계좌 모드는 .env 파일에서만 바꿀 수 있습니다"
             rows.append(row)
         return rows
 
     # ── 쓰기 ──
-    def update(self, section: str, values: dict, autoinvest=None) -> list[tuple[str, object, object]]:
-        """검증 → 즉시 적용(dict 제자리 갱신) → 저장. 바뀐 (라벨, 이전, 이후) 목록을 돌려준다."""
+    def _prepare(self, section: str, values: dict, autoinvest=None, ctx: dict | None = None):
+        """검증만 한다 → (정리된 값, 바뀔 (라벨, 이전, 이후) 목록). ctx = 함께 바뀔 다른 구역 값(복구용)."""
+        ctx = ctx or {}
         if section == "holidays":
             new = _clean_holidays(values.get("holidays"))
             old = sorted(self.s.holidays)
-            if new == old:
-                return []
-            self.s.holidays.clear()
-            self.s.holidays.update(new)
-            self._save("holidays", new)
-            return [("휴장일", f"{len(old)}일", f"{len(new)}일")]
+            return new, ([] if new == old else [("휴장일", f"{len(old)}일", f"{len(new)}일")])
         if section not in SCHEMA:
             raise SettingsError("알 수 없는 설정 구역")
         fields = {f["key"]: f for f in SCHEMA[section]}
@@ -223,27 +259,46 @@ class SettingsStore:
             for k in ("build_time", "rebalance_time"):
                 if not _tsec(merged["session_start"]) <= _tsec(merged[k]) < _tsec(merged["session_end"]):
                     raise SettingsError(f"{fields[k]['label']}은 감시 시간 안이어야 합니다")
+        if section == "report":
+            summary = {**self.s.engine, **ctx.get("engine", {})}["summary_time"]
+            if _tsec(merged["send_time"]) <= _tsec(summary):
+                raise SettingsError(f"보내는 시각은 장 마감 요약({summary})보다 뒤여야 합니다")
         if section == "autoinvest" and merged["min_trade_dev_pp"] >= merged["rebalance_band_pp"]:
             raise SettingsError("조정 최소 차이는 리밸런싱 허용 범위보다 작아야 합니다")
         changes = []
         for k, v in cleaned.items():
             if k == "rebalance_mode":
                 old = autoinvest.rebalance_mode() if autoinvest else cur.get(k)
-                if old != v and autoinvest:
-                    autoinvest.set_rebalance_mode(v)
             else:
                 old = cur.get(k)
                 old = list(old) if isinstance(old, list) else old
             if old != v:
                 changes.append((fields[k]["label"], old, v))
+        return cleaned, changes
+
+    def _apply(self, section: str, cleaned, autoinvest=None) -> None:
+        if section == "holidays":
+            self.s.holidays.clear()
+            self.s.holidays.update(cleaned)
+            self._save("holidays", cleaned)
+            return
+        cur = self.current(section)
         for k, v in cleaned.items():
             if k == "rebalance_mode":
+                if autoinvest and autoinvest.rebalance_mode() != v:
+                    autoinvest.set_rebalance_mode(v)
                 continue
             if isinstance(cur.get(k), list):
                 cur[k][:] = v                           # 다른 객체가 같은 리스트를 참조 중 → 제자리 갱신
             else:
                 cur[k] = v
         self._save(section, {k: cur[k] for k in cur if not k.startswith("_") and k != "rebalance_mode"})
+
+    def update(self, section: str, values: dict, autoinvest=None) -> list[tuple[str, object, object]]:
+        """검증 → 즉시 적용(dict 제자리 갱신) → 저장. 바뀐 (라벨, 이전, 이후) 목록을 돌려준다."""
+        cleaned, changes = self._prepare(section, values, autoinvest)
+        if changes or section != "holidays":
+            self._apply(section, cleaned, autoinvest)
         return changes
 
     def reset(self, section: str) -> None:
@@ -269,7 +324,7 @@ class SettingsStore:
             else:
                 ov["holidays"] = values
         else:
-            diff = {k: v for k, v in values.items() if self.defaults[section].get(k) != v}
+            diff = {k: v for k, v in values.items() if self.defaults.get(section, {}).get(k) != v}
             if diff:
                 ov[section] = diff
             else:
@@ -281,10 +336,68 @@ class SettingsStore:
         tmp.write_text(json.dumps(ov, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
 
+    # ── 백업 / 복구 ──
+    def export(self, rebalance_mode: str) -> dict:
+        """설정 백업. 비밀값(앱키·토큰·비밀번호·PIN), 계좌번호, 브로커 종류는 넣지 않는다."""
+        st = {}
+        for sec in BACKUP_SECTIONS:
+            cur = self.current(sec)
+            st[sec] = {f["key"]: (rebalance_mode if f["key"] == "rebalance_mode" else cur.get(f["key"]))
+                       for f in SCHEMA[sec]}
+        st["holidays"] = sorted(self.s.holidays)
+        env = {k: os.getenv(k) for k in ENV_BACKUP if os.getenv(k)}
+        return {"app": "jangjung", "kind": "settings-backup", "version": 1,
+                "exported_at": timeutil.now().isoformat(timespec="seconds"),
+                "note": "비밀값(앱키·토큰·비밀번호·PIN), 계좌번호, 브로커 종류는 들어 있지 않습니다.",
+                "settings": st, "env": env}
+
+    def restore(self, data, autoinvest=None, apply: bool = False, env_ok: bool = True) -> dict:
+        """백업 파일 검증 → 바뀔 내용 미리보기(apply=False) 또는 적용. 하나라도 잘못되면 아무것도 바꾸지 않는다."""
+        if not isinstance(data, dict) or data.get("kind") != "settings-backup" or data.get("app") != "jangjung":
+            raise SettingsError("장중대리 설정 백업 파일이 아닙니다")
+        if int(data.get("version") or 0) > 1:
+            raise SettingsError("더 새 버전에서 만든 백업입니다 — 프로그램을 업데이트하세요")
+        st = data.get("settings") or {}
+        if not isinstance(st, dict):
+            raise SettingsError("백업 파일 형식이 잘못되었습니다")
+        plan, ctx, changes, ignored = [], {}, [], []
+        for sec in (*BACKUP_SECTIONS, "holidays"):
+            if sec not in st:
+                continue
+            if sec == "holidays":
+                vals = {"holidays": st[sec]}
+            else:
+                if not isinstance(st[sec], dict):
+                    raise SettingsError(f"{SECTION_LABEL[sec]}: 형식이 잘못되었습니다")
+                known = {f["key"] for f in SCHEMA[sec]}
+                ignored += [f"{sec}.{k}" for k in st[sec] if k not in known]
+                vals = {k: v for k, v in st[sec].items() if k in known}
+            try:
+                cleaned, ch = self._prepare(sec, vals, autoinvest, ctx)
+            except SettingsError as e:
+                raise SettingsError(f"[{SECTION_LABEL[sec]}] {e}") from e
+            ctx[sec] = cleaned
+            plan.append((sec, cleaned, ch))
+            changes += [(SECTION_LABEL[sec], lbl, o, n) for lbl, o, n in ch]
+        env_in = data.get("env") or {}
+        if not isinstance(env_in, dict):
+            raise SettingsError("백업 파일의 연결 설정 형식이 잘못되었습니다")
+        ignored += [f"env.{k}" for k in env_in if k not in ENV_BACKUP]
+        env_set = {k: str(v) for k, v in env_in.items() if k in ENV_BACKUP and os.getenv(k, "") != str(v)}
+        env_todo = self._validate_env(env_set, []) if env_set else {}
+        spec = {f["key"]: f for f in ENV_SCHEMA}
+        if env_todo and env_ok:
+            changes += [("연결 설정", spec[k]["label"], os.getenv(k, "") or "(없음)", v) for k, v in env_todo.items()]
+        if apply:
+            for sec, cleaned, ch in plan:
+                if ch:
+                    self._apply(sec, cleaned, autoinvest)
+            if env_todo and env_ok:
+                self._write_env(env_todo)
+        return {"changes": changes, "ignored": ignored, "env_skipped": bool(env_todo) and not env_ok}
+
     # ── .env ──
-    def update_env(self, set_values: dict, clear: list[str]) -> tuple[list[str], list[str]]:
-        """(.env 에 반영된 라벨들, 재시작이 필요한 라벨들)."""
-        from dotenv import set_key, unset_key
+    def _validate_env(self, set_values: dict, clear: list[str]) -> dict[str, str | None]:
         spec = {f["key"]: f for f in ENV_SCHEMA}
         todo: dict[str, str | None] = {}
         for k, v in (set_values or {}).items():
@@ -293,11 +406,16 @@ class SettingsStore:
             v = str(v).strip()
             if not v:
                 continue                                # 빈칸 = 그대로 둠
+            if k == "BROKER" and v == os.getenv("BROKER", "sim"):
+                continue                                # 그대로 = 변경 아님
+            if k == "BROKER" and os.getenv("BROKER", "") == "kis_real":
+                raise SettingsError("실전 계좌 모드는 .env 파일에서만 바꿀 수 있습니다")
             if len(v) > 512 or "\n" in v or "\r" in v or "'" in v:
                 raise SettingsError(f"{spec[k]['label']}: 허용되지 않는 문자")
             f = spec[k]
             if f["kind"] == "enum" and v not in f["options"]:
-                raise SettingsError(f"{f['label']}: 허용되지 않는 값")
+                raise SettingsError(f"{f['label']}: 허용되지 않는 값"
+                                    + (" — 실전 계좌는 .env 파일에서만 설정합니다" if v == "kis_real" else ""))
             if f["kind"] == "account" and not re.fullmatch(r"\d{8}(-?\d{2})?", v):
                 raise SettingsError(f"{f['label']}: 숫자 8자리")
             if f["kind"] == "model" and not re.fullmatch(r"[a-z0-9][a-z0-9.\-]{2,60}", v):
@@ -311,6 +429,11 @@ class SettingsStore:
             if k == "BROKER":
                 raise SettingsError("브로커는 지울 수 없습니다 (sim 또는 kis 선택)")
             todo[k] = None
+        return todo
+
+    def _write_env(self, todo: dict[str, str | None]) -> tuple[list[str], list[str]]:
+        from dotenv import set_key, unset_key
+        spec = {f["key"]: f for f in ENV_SCHEMA}
         if not ENV_PATH.exists():
             ENV_PATH.write_text("", encoding="utf-8")
         changed, restart = [], []
@@ -327,6 +450,10 @@ class SettingsStore:
                 self.restart_required.add(spec[k]["label"])
         return changed, restart
 
+    def update_env(self, set_values: dict, clear: list[str]) -> tuple[list[str], list[str]]:
+        """(.env 에 반영된 라벨들, 재시작이 필요한 라벨들)."""
+        return self._write_env(self._validate_env(set_values, clear))
+
 
 def load_overrides(settings) -> None:
     """load_settings 직후 호출: data/settings.local.json 의 값을 제자리 반영."""
@@ -337,7 +464,7 @@ def load_overrides(settings) -> None:
         ov = json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return
-    for sec in ("safety", "engine", "autoinvest"):
+    for sec in ("safety", "engine", "autoinvest", "report", "notify"):
         fields = {f["key"]: f for f in SCHEMA[sec]}
         for k, v in (ov.get(sec) or {}).items():
             if k in fields and k != "rebalance_mode":

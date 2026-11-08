@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 from . import timeutil
@@ -30,7 +31,16 @@ HELP = """장중대리 사용법
 · 자동 투자: "자동 투자 1,000만 원, 3단계로 시작해 줘" (처음엔 성향 질문 6개)
 · 멈춰 — 모든 규칙과 자동 투자 즉시 중지
 /status 상태 · /rules 규칙 · /portfolio 자동투자 · /journal 최근 주문
+/report daily|weekly|monthly|all [날짜] — PDF 보고서를 텔레그램으로
+/alerts — 알림 설정 보기 · /alerts 체결 off — 끄기 (체결·자동투자·요약·설정·보고서)
 /mode auto|confirm 리밸런싱 방식 · /resume 중지 해제 · /summary 지금 요약 · /new 대화 초기화"""
+
+
+class RealTradingLocked(RuntimeError):
+    """실전 계좌 잠금 — 두 가지 설정이 모두 있어야 실전 주문 브로커를 만든다."""
+
+
+BROKER_LABEL = {"sim": "시뮬레이터", "kis-mock": "KIS 모의투자", "kis-real": "KIS 실전"}
 
 
 class App:
@@ -42,7 +52,9 @@ class App:
         self.control = Control(self.db, settings.safety)
         self.journal = Journal(settings.data_dir, settings.google_sa_file, settings.google_sheet_id)
         inner = notifier if notifier is not None else (ConsoleNotifier() if console else None)
-        self.notifier = FeedNotifier(self.db, inner)
+        self.notifier = FeedNotifier(self.db, inner, settings.notify)
+        from .settings_store import SettingsStore
+        self.store = SettingsStore(settings, settings.extra.get("defaults") or {})
         self.pending = PendingStore(self.db, self.notifier)
         self.gateway = OrderGateway(self.db, self.broker, self.universe, self.control, self.journal, self.notifier,
                                     settings)
@@ -57,9 +69,16 @@ class App:
 
     def _make_broker(self):
         s = self.settings
-        if s.broker == "kis":
+        if s.broker in ("kis", "kis_real"):
             from .broker.kis import KISBroker
-            return KISBroker(s.kis_app_key, s.kis_app_secret, s.kis_account, s.kis_account_product, s.data_dir)
+            real = s.broker == "kis_real"
+            if real and os.getenv("KIS_REAL_TRADING", "").strip().lower() != "yes":
+                raise RealTradingLocked("BROKER=kis_real 은 실제 돈으로 주문합니다. 정말 실전으로 운영하려면 "
+                                        ".env 에 KIS_REAL_TRADING=yes 를 함께 넣으세요.")
+            return KISBroker(s.kis_app_key, s.kis_app_secret, s.kis_account, s.kis_account_product, s.data_dir,
+                             real=real)
+        if s.broker not in ("sim", ""):
+            raise RealTradingLocked(f"알 수 없는 BROKER 값: {s.broker} (sim | kis | kis_real)")
         return SimBroker(self.db, self.universe.name, s.sim, s.data_dir)
 
     @property
@@ -121,10 +140,19 @@ class App:
         if self._norm(t) in STOP_WORDS:
             return await self.emergency_stop()
         if t.startswith("/"):
-            return await self.command(t)
+            return await self.command(t, via)
         return await self.agent.ask(t)
 
-    async def command(self, t: str) -> str | None:
+    def alerts_text(self) -> str:
+        from .settings_store import SCHEMA
+        lines = ["[알림 설정] 꺼 둔 알림은 텔레그램으로 보내지 않고 대시보드에만 남깁니다."]
+        for f in SCHEMA["notify"]:
+            lines.append(f"· {f['label']}: {'켜짐' if self.settings.notify.get(f['key'], 'on') == 'on' else '꺼짐'}")
+        lines.append("확인 카드·안전 경고(전체 중지·시세 이상·손실 한도·API 오류)·주문 실패는 항상 보냅니다.")
+        lines.append("바꾸기: /alerts 체결 off · /alerts 요약 on (체결·자동투자·요약·설정·보고서)")
+        return "\n".join(lines)
+
+    async def command(self, t: str, via: str = "console") -> str | None:
         cmd, _, arg = t.partition(" ")
         cmd = cmd.lower().split("@")[0]
         if cmd in ("/start", "/help"):
@@ -151,6 +179,37 @@ class App:
             return "\n".join(f"{o['created_at'][5:16]} {o['name']} {'매수' if o['side'] == 'buy' else '매도'} {o['qty']}주 "
                              f"· 판단 {o['decision_price']:,.0f} · 체결 {o['avg_fill_price'] or 0:,.0f} · {o['status']}\n  {o['reason']}"
                              for o in rows)
+        if cmd == "/alerts":
+            from .settings_store import NOTIFY_ALIASES, SCHEMA
+            parts = arg.split()
+            if not parts:
+                return self.alerts_text()
+            keys = {f["key"] for f in SCHEMA["notify"]}
+            key = NOTIFY_ALIASES.get(parts[0], parts[0].lower())
+            val = {"on": "on", "켜": "on", "켜기": "on", "off": "off", "꺼": "off", "끄기": "off"}.get(
+                parts[1].lower() if len(parts) > 1 else "")
+            if key not in keys or not val:
+                return "사용법: /alerts 체결 off · /alerts 요약 on (체결·자동투자·요약·설정·보고서)"
+            self.store.update("notify", {key: val})
+            await self.notifier.send(f"[설정 변경 · 알림] {via}에서 변경: {parts[0]} → {'켜짐' if val == 'on' else '꺼짐'}",
+                                     category="settings")
+            return self.alerts_text()
+        if cmd == "/report":
+            from .pdfreport import PERIODS, deliver_reports, telegram_target
+            parts = arg.split()
+            period = (parts[0] if parts else "daily").lower()
+            periods = list(PERIODS) if period == "all" else [period]
+            if any(p not in PERIODS for p in periods):
+                return "사용법: /report daily|weekly|monthly|all [YYYY-MM-DD]"
+            if telegram_target(self) is None:
+                return "텔레그램 봇이 연결되어 있지 않습니다. 대시보드 보고서 탭에서 PDF를 받거나 메일로 보내세요."
+            try:
+                res = await deliver_reports(self, periods, parts[1] if len(parts) > 1 else None, ["telegram"])
+            except ValueError:
+                return "날짜는 YYYY-MM-DD 형식으로 적어 주세요."
+            except Exception as e:  # noqa: BLE001
+                return f"보고서를 보내지 못했습니다: {e}"
+            return res["message"]
         if cmd == "/stop":
             return await self.emergency_stop()
         if cmd == "/resume":

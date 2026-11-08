@@ -380,6 +380,23 @@ input[type="date"] { padding: 6px 10px; border: 1px solid var(--border); border-
 
     <!-- 보고서 -->
     <section class="tab" id="tab-reports">
+      <div class="card" style="margin-bottom:14px">
+        <h2>PDF 보고서 · 메일</h2>
+        <p class="sub">1장 핵심 요약 + 세부 내역(수익·자산, 주문 근거·체결가, 안전 장치 기록, 규칙, 점검) · 총 3~5장. 주간은 그 주 월요일부터, 월간은 1일부터 고른 날짜까지.</p>
+        <div class="row-actions" style="margin-bottom:12px;align-items:center">
+          <div class="seg" id="pdfPeriod">
+            <button type="button" data-p="daily" aria-pressed="true">일간</button>
+            <button type="button" data-p="weekly" aria-pressed="false">주간</button>
+            <button type="button" data-p="monthly" aria-pressed="false">월간</button>
+          </div>
+          <input type="date" id="pdfDate">
+          <button class="btn small" id="pdfView">미리보기</button>
+          <button class="btn small primary" id="pdfDown">PDF 받기</button>
+          <button class="btn small" id="pdfMail">메일로 보내기</button>
+          <button class="btn small" id="pdfTg">텔레그램으로 보내기</button>
+        </div>
+        <div class="hint" id="mailInfo"></div>
+      </div>
       <div class="grid two">
         <div class="card">
           <h2>일일보고서</h2>
@@ -415,12 +432,26 @@ input[type="date"] { padding: 6px 10px; border: 1px solid var(--border); border-
 
       <div class="sec-title">운영 설정 <span class="muted" style="font-weight:400">· 저장하면 바로 적용 · 바뀐 내용은 알림으로 기록</span></div>
       <div class="grid two">
-        <div class="card" id="form-safety"></div>
+        <div class="grid" style="gap:14px;align-content:start">
+          <div class="card" id="form-safety"></div>
+          <div class="card" id="form-notify"></div>
+        </div>
         <div class="grid" style="gap:14px;align-content:start">
           <div class="card" id="form-engine"></div>
           <div class="card" id="form-autoinvest"></div>
+          <div class="card" id="form-report"></div>
           <div class="card" id="form-holidays"></div>
         </div>
+      </div>
+
+      <div class="sec-title">설정 백업 · 복구</div>
+      <div class="card" id="backupCard">
+        <p class="sub">운영 설정(안전 한도·일정·자동 투자·보고서·알림·휴장일)과 비밀이 아닌 연결 설정을 JSON 파일로 내려받고, 다른 PC나 재설치 후에 올려 복구합니다. 앱키·토큰·비밀번호·PIN·계좌번호·브로커 종류는 백업에 들어가지 않습니다. 규칙과 자동 투자는 확인 카드를 거쳐야 하므로 포함하지 않습니다.</p>
+        <div class="row-actions" style="align-items:center">
+          <a class="btn" href="/api/settings/backup" download>백업 파일 받기</a>
+          <label class="btn">복구할 파일 선택<input type="file" id="restoreFile" accept=".json,application/json" hidden></label>
+        </div>
+        <div id="restorePreview"></div>
       </div>
 
       <div class="sec-title">시험용 수동 실행</div>
@@ -536,7 +567,7 @@ async function loadStatus() {
   const st = await api("/api/status");
   state.status = st;
   const b = $("#badges"); b.replaceChildren();
-  const brokerLabel = st.broker === "sim" ? "시뮬레이터" : st.broker === "kis-mock" ? "KIS 모의투자" : st.broker;
+  const brokerLabel = st.broker === "sim" ? "시뮬레이터" : st.broker === "kis-mock" ? "KIS 모의투자" : st.broker === "kis-real" ? "⚠ KIS 실전" : st.broker;
   b.append(h("span", { class: "badge" }, h("i", { class: "dot " + (st.halted ? "bad" : st.in_session ? "on" : "") }),
     st.halted ? "중지됨" : (st.in_session ? "장중" : (st.trading_day ? "장외" : "휴장일"))));
   b.append(h("span", { class: "badge opt" }, h("i", { class: "dot " + (st.broker === "sim" ? "warn" : "on") }), brokerLabel));
@@ -833,9 +864,52 @@ function openReport(date, kind) {
   else { const a = h("a", { href: repUrl(date, kind === "csv" ? "csv" : "html", true), download: `jangjung_daily_${date}.${kind === "csv" ? "csv" : "html"}` }); document.body.append(a); a.click(); a.remove(); }
 }
 $$("[data-rep]").forEach(b => b.addEventListener("click", () => { const d = $("#reportDate").value; if (d) openReport(d, b.dataset.rep); }));
+const PERIOD_LABEL = { daily: "일간", weekly: "주간", monthly: "월간" };
+let pdfPeriod = "daily", mailState = null, tgReady = false;
+$$("#pdfPeriod button").forEach(b => b.addEventListener("click", () => {
+  pdfPeriod = b.dataset.p; $$("#pdfPeriod button").forEach(x => x.setAttribute("aria-pressed", String(x === b)));
+}));
+const pdfUrl = (dl) => `/api/report/pdf?period=${pdfPeriod}&date=${encodeURIComponent($("#pdfDate").value)}${dl ? "&download=1" : ""}`;
+$("#pdfView").addEventListener("click", () => { if ($("#pdfDate").value) window.open(pdfUrl(false), "_blank", "noopener"); });
+$("#pdfDown").addEventListener("click", () => {
+  if (!$("#pdfDate").value) return;
+  const a = h("a", { href: pdfUrl(true), download: `jangjung_${pdfPeriod}_${$("#pdfDate").value}.pdf` }); document.body.append(a); a.click(); a.remove();
+});
+$("#pdfMail").addEventListener("click", async (ev) => {
+  const date = $("#pdfDate").value; if (!date) return;
+  if (!mailState?.ready) { toast("메일 설정이 없습니다 — 설정 탭 > 연결 설정에서 SMTP 항목을 입력하세요"); return; }
+  if (!confirm(`${PERIOD_LABEL[pdfPeriod]} 보고서(${date})를 ${mailState.to.join(", ")}로 보낼까요?`)) return;
+  const b = ev.currentTarget; b.disabled = true; b.textContent = "보내는 중…";
+  try { const r = await post("/api/report/email", { period: pdfPeriod, date }); toast("✓ " + r.message); }
+  catch (e) { toast("✕ " + e.message); }
+  b.disabled = false; b.textContent = "메일로 보내기"; loadReports();
+});
+$("#pdfTg").addEventListener("click", async (ev) => {
+  const date = $("#pdfDate").value; if (!date) return;
+  if (!tgReady) { toast("텔레그램 봇이 연결되어 있지 않습니다 — 봇 토큰·chat_id 입력 후 다시 시작하세요"); return; }
+  const b = ev.currentTarget; b.disabled = true; b.textContent = "보내는 중…";
+  try { const r = await post("/api/report/send", { period: pdfPeriod, date, channel: "telegram" }); toast("✓ " + r.message); }
+  catch (e) { toast("✕ " + e.message); }
+  b.disabled = false; b.textContent = "텔레그램으로 보내기"; loadReports();
+});
+function renderMailInfo(m, tg) {
+  mailState = m; tgReady = !!tg;
+  const on = Object.entries({ email_daily: "일간", email_weekly: "주간(주 마지막 거래일)", email_monthly: "월간(월 마지막 거래일)" })
+    .filter(([k]) => m.report[k] === "on").map(([, v]) => v);
+  const ch = m.report.channel || "both";
+  const dest = [];
+  if ((ch === "both" || ch === "email") && m.ready) dest.push("메일 " + m.to.join(", "));
+  if ((ch === "both" || ch === "telegram") && tg) dest.push("텔레그램");
+  const last = m.last ? `최근 발송 ${m.last.at.slice(5, 16).replace("T", " ")} ${m.last.ok ? "성공" : "실패: " + (m.last.error || "")}` : "아직 보낸 적 없음";
+  $("#mailInfo").replaceChildren(dest.length
+    ? `자동 발송: ${on.length ? on.join(" · ") : "끔"} · 매 거래일 ${m.report.send_time} → ${dest.join(" + ")} · ${last}`
+    : "보낼 곳이 연결되지 않아 자동 발송은 꺼져 있습니다. 설정 탭에서 메일(SMTP)이나 텔레그램 봇을 연결하고, '보고서'에서 받는 곳을 고르세요.");
+}
 async function loadReports() {
   const d = await api("/api/reports");
   if (!$("#reportDate").value) $("#reportDate").value = d.today;
+  if (!$("#pdfDate").value) $("#pdfDate").value = d.today;
+  renderMailInfo(d.email, d.telegram_ready);
   $("#reportsTable").replaceChildren(table(["날짜", "받기"], d.dates.map(dt => [dt + (dt === d.today ? " (오늘)" : ""),
     { el: h("div", { class: "row-actions", style: "justify-content:flex-end" },
       h("button", { class: "btn small ghost", onclick: () => openReport(dt, "view") }, "보기"),
@@ -863,9 +937,9 @@ function checkBtn(label, path) {
 }
 function renderStatusCards(st) {
   const b = st.broker, tg = st.telegram, sh = st.sheets, cl = st.claude, ms = st.master;
-  const brokerLevel = b.last_error && b.api_errors ? "bad" : (b.mode === "kis" ? "ok" : "warn");
+  const brokerLevel = b.last_error && b.api_errors ? "bad" : (b.mode === "kis" || b.mode === "kis_real" ? "ok" : "warn");
   $("#statusCards").replaceChildren(
-    statusCard("증권사", brokerLevel, b.mode === "kis" ? "KIS 모의투자" : "시뮬레이터",
+    statusCard("증권사", brokerLevel, b.mode === "kis_real" ? "KIS 실전 (실제 돈)" : b.mode === "kis" ? "KIS 모의투자" : "시뮬레이터",
       [["앱키", b.kis_keys ? "설정됨" : "없음"], ["계좌", b.account || "—"], ["연속 오류", b.api_errors + "회"],
        ["마지막 정상", b.last_ok ? b.last_ok.slice(5, 19).replace("T", " ") : "—"], ["마지막 오류", b.last_error ? b.last_error[1] : "—"]],
       null, checkBtn("연결 점검", "/api/check/broker")),
@@ -877,6 +951,13 @@ function renderStatusCards(st) {
       [["상태", sh.enabled ? "매매일지·일일요약 탭에 기록" : "로컬 CSV에만 기록"], ["최근 오류", sh.error || "—"]],
       sh.enabled ? null : "시트를 서비스 계정 이메일에 편집자로 공유한 뒤 경로와 시트 ID를 입력",
       sh.enabled ? checkBtn("접근 확인", "/api/check/sheets") : null),
+    statusCard("보고서 메일", st.email.ready ? (st.email.last && !st.email.last.ok ? "bad" : "ok") : "off",
+      st.email.ready ? (st.email.last && !st.email.last.ok ? "최근 발송 실패" : "설정됨") : "미설정",
+      [["메일 서버", st.email.host || "—"], ["받는 주소", st.email.to.join(", ") || "—"],
+       ["최근 발송", st.email.last ? st.email.last.at.slice(5, 16).replace("T", " ") + (st.email.last.ok ? " 성공" : " 실패") : "—"]],
+      st.email.ready ? (st.email.last && !st.email.last.ok ? st.email.last.error : null)
+        : "Gmail: 메일 서버 smtp.gmail.com · 포트 587 · 계정 · 앱 비밀번호(Google 계정 > 보안 > 앱 비밀번호)",
+      st.email.ready ? checkBtn("테스트 메일", "/api/check/email") : null),
     statusCard("Claude", cl.connected ? "ok" : "warn", cl.connected ? "연결됨" : "첫 대화 때 연결",
       [["모델", cl.model], ["인증", cl.auth], ["역할", "자연어→규칙, 확인 카드 (주문 권한 없음)"]]),
     statusCard("종목 마스터", ms.file ? "ok" : "warn", ms.file ? "최신화됨" : "기본 목록",
@@ -897,7 +978,9 @@ function renderEnv(st) {
   const inputs = {}; const clears = new Set();
   for (const f of st.env) {
     let ctrl;
-    if (f.kind === "enum") {
+    if (f.locked) {                                       // 실전 계좌: 화면에서 바꾸지 못함
+      ctrl = h("span", { class: "chip bad" }, "⚠ KIS 실전 — " + f.locked);
+    } else if (f.kind === "enum") {
       const holder = { value: f.value || Object.keys(f.options)[0] };
       inputs[f.key] = holder;
       ctrl = h("div", { class: "seg" }, Object.entries(f.options).map(([v, lbl]) => h("button", { type: "button", "aria-pressed": String(holder.value === v),
@@ -1084,6 +1167,8 @@ async function loadSettings(force = false) {
   renderSection("safety", "안전 한도", "넘는 주문·규칙은 실행하지 않고 확인을 요청합니다", st.schema.safety);
   renderSection("engine", "운영 일정", "장중 엔진이 이 시각에 맞춰 움직입니다", st.schema.engine);
   renderSection("autoinvest", "자동 투자", "분할 매수·리밸런싱 방식", st.schema.autoinvest);
+  renderSection("report", "보고서", "일간·주간·월간 PDF(3~5장)를 골라 받습니다 · 세 가지 모두 켤 수 있음 · 메일 계정·텔레그램 봇은 위 연결 설정", st.schema.report);
+  renderSection("notify", "알림", "끈 알림은 텔레그램으로 보내지 않고 '대화·알림' 탭에만 남깁니다. 확인 카드·안전 경고·실패 알림은 항상 보냅니다. 텔레그램에서 /alerts 로도 바꿀 수 있습니다", st.schema.notify);
   renderHolidays(st.schema.holidays);
   state.dirty.clear();
   const lb = $("#logoutBox"); lb.replaceChildren();
@@ -1093,6 +1178,30 @@ $$("[data-job]").forEach(b => b.addEventListener("click", async () => {
   b.disabled = true; try { const r = await post("/api/run/" + b.dataset.job); toast(r.result || "완료"); } catch (e) { toast(e.message); }
   b.disabled = false; refreshAll();
 }));
+/* ── 설정 백업 · 복구 ── */
+$("#restoreFile").addEventListener("change", async (ev) => {
+  const file = ev.target.files[0]; ev.target.value = "";
+  const box = $("#restorePreview"); box.replaceChildren();
+  if (!file) return;
+  if (file.size > 256000) { toast("✕ 파일이 너무 큽니다"); return; }
+  let data;
+  try { data = JSON.parse(await file.text()); } catch { toast("✕ JSON 파일이 아닙니다"); return; }
+  let r;
+  try { r = await post("/api/settings/restore", { data, apply: false }); } catch (e) { toast("✕ " + e.message); return; }
+  const notes = [];
+  if (r.env_skipped) notes.push("데모 모드라 연결 설정은 복구하지 않습니다.");
+  if (r.ignored.length) notes.push("이 버전에 없는 항목은 건너뜁니다: " + r.ignored.join(", "));
+  if (!r.changes.length) { box.append(h("div", { class: "notice", style: "margin-top:12px" }, "지금 설정과 같습니다 — 바뀔 항목이 없습니다. " + notes.join(" "))); return; }
+  const apply = h("button", { class: "btn primary", onclick: async () => {
+    apply.disabled = true;
+    try { const x = await post("/api/settings/restore", { data, apply: true }); toast(`✓ ${x.changes.length}개 항목 복구 · 바로 적용됨`); box.replaceChildren(); state.dirty.clear(); loadSettings(true); }
+    catch (e) { toast("✕ " + e.message); apply.disabled = false; }
+  } }, `${r.changes.length}개 항목 복구`);
+  box.append(h("div", { class: "notice warn", style: "margin-top:12px" }, `${file.name} — 아래 항목이 바뀝니다. 안전 한도가 포함되어 있으면 특히 확인하세요.`),
+    table(["구역", "항목", "지금", "복구 후"], r.changes.map(c => [c.section, c.label, c.old, c.new]), [], { empty: "" }),
+    notes.length ? h("p", { class: "hint" }, notes.join(" ")) : null,
+    h("div", { class: "form-foot" }, h("span", { class: "status" }), h("button", { class: "btn ghost", onclick: () => box.replaceChildren() }, "취소"), apply));
+});
 addEventListener("beforeunload", e => { if (state.dirty.size) { e.preventDefault(); e.returnValue = ""; } });
 
 /* ── 갱신 루프 ── */

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import ipaddress
+import json
 import logging
 import os
 import secrets
@@ -26,6 +27,8 @@ from starlette.routing import Route
 
 from . import timeutil
 from .broker.base import BrokerError
+from .pdfreport import (PERIODS, MailError, build_report, deliver_reports, mail_config, mail_ready, mask_email,
+                        send_mail, telegram_target)
 from .report import build_daily, orders_csv, report_dates, to_csv, to_html
 from .rules import cond_text, qty_text
 from .settings_store import SECTION_LABEL, SettingsError, SettingsStore
@@ -48,7 +51,7 @@ class Dashboard:
         self._cache: dict[str, tuple[float, object]] = {}
         self._lock = asyncio.Lock()
         self.allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
-        self.store = SettingsStore(app.settings, app.settings.extra.get("defaults") or {})
+        self.store = app.store
 
     def _host_ok(self, host: str | None) -> bool:
         if not host:
@@ -128,6 +131,12 @@ class Dashboard:
             r("/api/settings", self.settings),
             r("/api/reports", self.reports),
             r("/api/report/daily", self.report_daily),
+            r("/api/report/pdf", self.report_pdf),
+            r("/api/report/email", self.report_email, ("POST",)),
+            r("/api/report/send", self.report_send, ("POST",)),
+            r("/api/settings/backup", self.settings_backup),
+            r("/api/settings/restore", self.settings_restore, ("POST",)),
+            r("/api/check/email", self.check_email, ("POST",)),
             r("/api/export/orders.csv", self.export_orders),
             r("/api/export/daily.csv", self.export_daily),
             r("/api/chat", self.chat, ("POST",)),
@@ -250,6 +259,10 @@ class Dashboard:
             "telegram": {"token": bool(s.telegram_token), "chat_id": bool(s.telegram_chat_id),
                          "running": a.telegram_running},
             "sheets": {"enabled": a.journal.sheets_enabled, "error": a.journal.sheets_error},
+            "telegram_reports": telegram_target(a) is not None,
+            "email": {"ready": mail_ready(), "host": mail_config()["host"],
+                      "to": [mask_email(t) for t in mail_config()["to"]], "last": a.db.kv_get("report_mail_last"),
+                      "report": {k: v for k, v in s.report.items() if not k.startswith("_")}},
             "claude": {"model": s.claude_model,
                        "auth": "ANTHROPIC_API_KEY" if os.getenv("ANTHROPIC_API_KEY") else "Claude Code 로그인",
                        "connected": bool(a._agent and a._agent.client)},
@@ -270,8 +283,102 @@ class Dashboard:
             "config_files": ["config/settings.json", "config/strategies.json", ".env"],
         })
 
+    @staticmethod
+    def _period_args(period: str, date: str) -> str | None:
+        if period not in PERIODS:
+            return "period=daily|weekly|monthly"
+        try:
+            from datetime import date as _d
+            _d.fromisoformat(date)
+        except ValueError:
+            return "date=YYYY-MM-DD"
+        return None
+
+    async def report_pdf(self, request):
+        period = request.query_params.get("period", "daily")
+        date = request.query_params.get("date") or timeutil.today_str()
+        if err := self._period_args(period, date):
+            return JSONResponse({"error": err}, 400)
+        rep = await build_report(self.app, period, date)
+        disp = "attachment" if request.query_params.get("download") else "inline"
+        return Response(rep.pdf, media_type="application/pdf",
+                        headers={"Content-Disposition": f'{disp}; filename="{rep.filename}"',
+                                 "X-Report-Pages": str(rep.pages), "Cache-Control": "no-store"})
+
+    async def report_email(self, request):
+        return await self.report_send(request, channel="email")
+
+    async def report_send(self, request, channel: str | None = None):
+        """지금 보고서 보내기. channel: email | telegram (기본: 설정의 '받는 곳')."""
+        body = await self._body(request)
+        periods = body.get("periods") or [body.get("period", "daily")]
+        date = str(body.get("date") or timeutil.today_str())
+        periods = [p for p in PERIODS if p in periods]         # 순서 고정 · 중복 제거
+        for p in periods or ["?"]:
+            if err := self._period_args(p, date):
+                return JSONResponse({"error": err}, 400)
+        channel = channel or str(body.get("channel") or self.app.settings.report.get("channel", "both"))
+        if channel not in ("email", "telegram", "both"):
+            return JSONResponse({"error": "channel=email|telegram|both"}, 400)
+        if channel == "email" and not mail_ready():
+            return JSONResponse({"error": "메일 설정이 없습니다 — 설정 탭 > 연결 설정에서 SMTP 항목을 입력하세요"}, 400)
+        if channel == "telegram" and telegram_target(self.app) is None:
+            return JSONResponse({"error": "텔레그램 봇이 연결되어 있지 않습니다 (봇 토큰·chat_id 입력 후 다시 시작)"}, 400)
+        from .pdfreport import channels_for
+        chans = channels_for(self.app, channel)
+        if not chans:
+            return JSONResponse({"error": "보낼 곳이 없습니다 — 메일(SMTP) 또는 텔레그램 봇을 연결하세요"}, 400)
+        try:
+            res = await deliver_reports(self.app, periods, date, chans)
+        except MailError as e:
+            return JSONResponse({"error": str(e)}, 400)
+        await self.app.notifier.send(f"[보고서 발송] {res['message']} (웹에서 요청)",
+                                     category=None if res["errors"] else "report")
+        return JSONResponse({"ok": True, "message": res["message"]})
+
+    # ── 설정 백업 / 복구 ──
+    async def settings_backup(self, request):
+        data = self.store.export(self.app.autoinvest.rebalance_mode())
+        name = f"jangjung_settings_{timeutil.now().strftime('%Y%m%d_%H%M')}.json"
+        return Response(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+                        media_type="application/json",
+                        headers={"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"})
+
+    async def settings_restore(self, request):
+        if int(request.headers.get("content-length") or 0) > 256_000:
+            return JSONResponse({"error": "파일이 너무 큽니다 (256KB 이하)"}, 413)
+        body = await self._body(request)
+        apply = bool(body.get("apply"))
+        env_ok = not self.app.settings.extra.get("demo")
+        res = self.store.restore(body.get("data"), self.app.autoinvest, apply=apply, env_ok=env_ok)
+        rows = [{"section": sec, "label": lbl, "old": self._fmt(o), "new": self._fmt(n)} for sec, lbl, o, n in res["changes"]]
+        if apply and rows:
+            if any(r["section"] == "연결 설정" for r in rows):
+                await self._apply_live_env()
+            lines = [f"· {r['section']} · {r['label']}: {r['old']} → {r['new']}" for r in rows[:20]]
+            more = f"\n… 외 {len(rows) - 20}개" if len(rows) > 20 else ""
+            await self.app.notifier.send(f"[설정 복구] 백업 파일에서 {len(rows)}개 항목 복구\n" + "\n".join(lines) + more,
+                                         category="settings")
+            self.invalidate()
+        return JSONResponse({"ok": True, "applied": apply, "changes": rows, "ignored": res["ignored"],
+                             "env_skipped": res["env_skipped"]})
+
+    async def check_email(self, request):
+        if not mail_ready():
+            return JSONResponse({"error": "메일 서버 · 계정 · 비밀번호를 먼저 넣으세요"}, 400)
+        try:
+            to = await asyncio.to_thread(send_mail, "[장중대리] 메일 연결 테스트",
+                                         "장중대리 보고서 메일 연결 테스트입니다. 이 메일이 보이면 설정이 맞습니다.", [])
+        except MailError as e:
+            return JSONResponse({"error": str(e)}, 400)
+        return JSONResponse({"ok": True, "message": "테스트 메일 보냄 → " + ", ".join(mask_email(t) for t in to)})
+
     async def reports(self, request):
-        return JSONResponse({"dates": report_dates(self.app.db), "today": timeutil.today_str()})
+        rep = {k: v for k, v in self.app.settings.report.items() if not k.startswith("_")}
+        return JSONResponse({"dates": report_dates(self.app.db), "today": timeutil.today_str(),
+                             "telegram_ready": telegram_target(self.app) is not None,
+                             "email": {"ready": mail_ready(), "to": [mask_email(t) for t in mail_config()["to"]],
+                                       "report": rep, "last": self.app.db.kv_get("report_mail_last")}})
 
     async def report_daily(self, request):
         date = request.query_params.get("date") or timeutil.today_str()
@@ -390,7 +497,7 @@ class Dashboard:
         if changes:
             lines = [f"· {lbl}: {self._fmt(o)} → {self._fmt(n)}" for lbl, o, n in changes]
             await self.app.notifier.send(f"[설정 변경 · {SECTION_LABEL.get(section, section)}] 웹 화면에서 변경\n"
-                                         + "\n".join(lines))
+                                         + "\n".join(lines), category="settings")
         self.invalidate()
         return JSONResponse({"ok": True, "changed": len(changes)})
 
@@ -399,7 +506,7 @@ class Dashboard:
         if section not in SECTION_LABEL:
             return JSONResponse({"error": "알 수 없는 설정 구역"}, 400)
         self.store.reset(section)
-        await self.app.notifier.send(f"[설정 변경 · {SECTION_LABEL[section]}] 기본값으로 되돌림")
+        await self.app.notifier.send(f"[설정 변경 · {SECTION_LABEL[section]}] 기본값으로 되돌림", category="settings")
         self.invalidate()
         return JSONResponse({"ok": True})
 
@@ -411,7 +518,17 @@ class Dashboard:
         changed, restart = self.store.update_env(body.get("set") or {}, body.get("clear") or [])
         if not changed:
             return JSONResponse({"ok": True, "changed": [], "restart": []})
-        # 다시 시작하지 않아도 되는 항목은 바로 반영
+        await self._apply_live_env()
+        msg = "[연결 설정 변경] " + ", ".join(changed) + " (값은 기록하지 않음)"
+        if restart:
+            msg += "\n다시 시작해야 적용: " + ", ".join(restart)
+        await self.app.notifier.send(msg, category="settings")
+        self.invalidate()
+        return JSONResponse({"ok": True, "changed": changed, "restart": restart})
+
+    async def _apply_live_env(self) -> None:
+        """다시 시작하지 않아도 되는 연결 설정을 바로 반영."""
+        s = self.app.settings
         s.telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
         inner = getattr(self.app.notifier, "inner", None)
         if inner is not None and hasattr(inner, "chat_id"):
@@ -423,12 +540,6 @@ class Dashboard:
         s.claude_model = os.getenv("CLAUDE_MODEL", "") or "claude-opus-5-5"
         if self.app._agent:
             await self.app._agent.reset()
-        msg = "[연결 설정 변경] " + ", ".join(changed) + " (값은 기록하지 않음)"
-        if restart:
-            msg += "\n다시 시작해야 적용: " + ", ".join(restart)
-        await self.app.notifier.send(msg)
-        self.invalidate()
-        return JSONResponse({"ok": True, "changed": changed, "restart": restart})
 
     async def check_telegram(self, request):
         import httpx

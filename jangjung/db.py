@@ -113,6 +113,9 @@ class DB:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        cols = {r["name"] for r in self.q("PRAGMA table_info(daily_snapshots)")}
+        if "detail" not in cols:          # 보고서용 장 마감 보유·비중 스냅샷 (JSON)
+            self.conn.execute("ALTER TABLE daily_snapshots ADD COLUMN detail TEXT")
 
     def q(self, sql: str, args: tuple | list = ()) -> list[dict]:
         return [dict(r) for r in self.conn.execute(sql, args).fetchall()]

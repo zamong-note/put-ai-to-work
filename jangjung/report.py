@@ -180,12 +180,17 @@ th{{color:#52514e;font-weight:600;white-space:nowrap}} td.nw{{white-space:nowrap
 </body></html>"""
 
 
-def orders_csv(db) -> bytes:
+def orders_csv(db, start: str | None = None, end: str | None = None) -> bytes:
+    """전체 매매일지 CSV. start/end(YYYY-MM-DD)를 주면 그 기간만."""
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["주문시각", "조건감지시각", "구분", "규칙/전략", "종목코드", "종목명", "매수/매도", "주문수량", "근거",
                 "판단시세", "체결수량", "평균체결가", "괴리(%)", "상태", "주문번호", "오류", "근거데이터"])
-    for o in db.q("SELECT * FROM orders ORDER BY id"):
+    if start and end:
+        rows = db.q("SELECT * FROM orders WHERE substr(created_at,1,10) BETWEEN ? AND ? ORDER BY id", (start, end))
+    else:
+        rows = db.q("SELECT * FROM orders ORDER BY id")
+    for o in rows:
         gap = _pct((o["avg_fill_price"] / o["decision_price"] - 1) * 100) if o["avg_fill_price"] else ""
         w.writerow([o["created_at"][:19], (o["detected_at"] or "")[:19], SOURCE.get(o["source"], o["source"]),
                     o["ref_id"], o["symbol"], o["name"], "매수" if o["side"] == "buy" else "매도", o["qty"], o["reason"],

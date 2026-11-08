@@ -114,14 +114,16 @@ class OrderGateway:
         return max(0, (held.qty if held else 0) - self.ledger.qty(symbol))
 
     # ── 주문 ──
-    async def submit(self, it: OrderIntent, confirmed_over_limit: bool = False) -> OrderOutcome:
+    async def submit(self, it: OrderIntent, confirmed_over_limit: bool = False,
+                     allow_suspended: bool = False) -> OrderOutcome:
+        """allow_suspended: 시세 이상으로 멈춘 종목이라도 사용자가 카드에서 '그래도 매도'를 누른 손절 매도만 True."""
         async with self._lock:
-            return await self._submit(it, confirmed_over_limit)
+            return await self._submit(it, confirmed_over_limit, allow_suspended and it.side == "sell")
 
-    async def _submit(self, it: OrderIntent, confirmed: bool) -> OrderOutcome:
+    async def _submit(self, it: OrderIntent, confirmed: bool, allow_suspended: bool = False) -> OrderOutcome:
         if h := self.control.halted():
             return OrderOutcome("blocked", f"전체 중지 상태 ({h['reason']})")
-        if it.symbol in self.control.suspended():
+        if it.symbol in self.control.suspended() and not allow_suspended:
             return OrderOutcome("blocked", f"{it.symbol} 매매 일시중단 중: {self.control.suspended()[it.symbol]['reason']}")
         if why := self.universe.blocked_reason(it.symbol):
             return OrderOutcome("blocked", why)
@@ -218,7 +220,7 @@ class OrderGateway:
                    f"근거: {o['reason']}\n판단 시세 {o['decision_price']:,.0f}원 · 주문번호 {o['broker_order_no']}")
         else:
             txt = f"[주문 실패] {o['name']} {side} {o['qty']}주\n근거: {o['reason']}\n오류: {o['error']}"
-        await self.notifier.send(txt)
+        await self.notifier.send(txt, category="fill" if o["status"] == "filled" else None)
 
     async def end_of_day_report_unfilled(self) -> list[dict]:
         return self.db.q("SELECT * FROM orders WHERE status IN ('submitted','partial')")

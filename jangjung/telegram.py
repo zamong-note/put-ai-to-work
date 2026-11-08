@@ -39,6 +39,17 @@ class TelegramNotifier:
             log.error("텔레그램 전송 실패: %s", e)
             return None
 
+    async def send_document(self, filename: str, data: bytes, caption: str = "",
+                            mime: str = "application/pdf") -> None:
+        """PDF·CSV 파일 전송 (보고서)."""
+        if not self.chat_id:
+            raise RuntimeError("TELEGRAM_CHAT_ID 미설정")
+        r = await self.http.post(f"{self.base}/sendDocument", data={"chat_id": self.chat_id, "caption": caption[:1000]},
+                                 files={"document": (filename, data, mime)}, timeout=60)
+        d = r.json()
+        if not d.get("ok"):
+            raise RuntimeError(f"파일 전송 실패: {d.get('description')}")
+
     async def clear_buttons(self, message_id: str | None, note: str | None = None) -> None:
         if not message_id or not self.chat_id:
             return
@@ -47,6 +58,15 @@ class TelegramNotifier:
                             reply_markup={"inline_keyboard": []})
         except Exception:  # noqa: BLE001
             pass
+
+
+BOT_COMMANDS = [
+    ("status", "전체 상태"), ("rules", "감시 중인 규칙"), ("portfolio", "자동 투자 현황"),
+    ("journal", "최근 주문 5건"), ("report", "PDF 보고서 받기: /report weekly"),
+    ("alerts", "알림 설정 보기·바꾸기: /alerts 체결 off"), ("summary", "지금 장 마감 요약"),
+    ("mode", "리밸런싱 방식: /mode auto|confirm"), ("stop", "모든 매매 즉시 중지"), ("resume", "중지 해제"),
+    ("new", "대화 초기화"), ("help", "사용법"),
+]
 
 
 class TelegramBot:
@@ -64,6 +84,10 @@ class TelegramBot:
     async def run(self) -> None:
         log.info("텔레그램 봇 폴링 시작")
         self.app.telegram_running = True
+        try:                                   # 텔레그램 입력창의 '/' 메뉴에 명령어 목록 표시
+            await self.n.call("setMyCommands", commands=[{"command": c, "description": d} for c, d in BOT_COMMANDS])
+        except Exception as e:  # noqa: BLE001
+            log.warning("명령어 메뉴 등록 실패: %s", e)
         while True:
             try:
                 updates = await self.n.call("getUpdates", offset=self.offset, timeout=30,

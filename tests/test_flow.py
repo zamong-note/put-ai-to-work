@@ -226,3 +226,70 @@ def test_agent_options_build(app):
     assert opts.tools == [] and all(t.startswith("mcp__jj__") for t in opts.allowed_tools)
     names = {t.name for t in app.agent.tools}
     assert not any("order" in n for n in names)          # LLM에게 주문 도구 없음
+
+
+# ── 폭락일 손절: 시세 이상으로 멈춘 종목도 손절은 '그래도 팔까요?'로 묻는다 ──
+async def _crash_setup(app):
+    set_price(app, "000660", 200000)                       # 평단 190,000 · 20주
+    res = await app.rules.propose("7% 떨어지면 전부 팔아 줘", HYNIX_RULES[1:])
+    await app.pending.resolve(res["pending_id"], "approve")
+    advance(5); set_price(app, "000660", 168000)           # 전일 대비 -16% (급락) · 수익률 -11.6%
+    await app.engine.tick()
+
+
+async def test_crash_stop_loss_asks_then_sells(app):
+    await _crash_setup(app)
+    assert app.db.q("SELECT * FROM orders") == []          # 자동으로 팔지 않음
+    assert "000660" in app.control.suspended()
+    last_pending(app, "symbol_resume")
+    pid = last_pending(app, "stoploss_anomaly")
+    assert app.db.one("SELECT status FROM rules")["status"] == "waiting_confirm"
+    advance(1); await app.engine.tick()                    # 같은 카드를 또 보내지 않음
+    assert len(app.pending.open_items("stoploss_anomaly")) == 1
+    msg = await app.pending.resolve(pid, "sell")
+    assert "체결" in msg, msg
+    o = app.db.q("SELECT * FROM orders")
+    assert len(o) == 1 and o[0]["side"] == "sell" and o[0]["qty"] == 20
+    assert "시세 이상 중 사용자 확인" in o[0]["reason"] and "anomaly_override" in o[0]["evidence"]
+    assert "000660" in app.control.suspended()             # 매수 등 다른 주문은 계속 멈춤
+    assert app.rules.active_count() == 0
+    assert audit(app.db, app.universe)["violations"] == []
+
+
+async def test_crash_stop_loss_hold_expire_and_halted(app):
+    await _crash_setup(app)
+    await app.pending.resolve(last_pending(app, "stoploss_anomaly"), "hold")
+    assert app.db.q("SELECT * FROM orders") == []
+    assert app.db.one("SELECT status FROM rules")["status"] == "active"
+    advance(1); await app.engine.tick()
+    assert app.pending.open_items("stoploss_anomaly") == []      # 오늘은 다시 묻지 않음
+    # 다음 날: 종목은 여전히 멈춤 → 다시 묻는다. 답이 없으면 만료 후 다시 묻는다
+    advance(24 * 60); await app.engine.tick()
+    pid = last_pending(app, "stoploss_anomaly")
+    advance(31); await app.pending.expire_old()
+    assert app.db.q("SELECT status FROM pending WHERE id=?", (pid,))[0]["status"] == "expired"
+    assert app.db.one("SELECT status FROM rules")["status"] == "active"
+    await app.engine.tick()
+    assert last_pending(app, "stoploss_anomaly") != pid
+    assert app.db.q("SELECT * FROM orders") == []
+
+
+async def test_crash_stop_loss_halted_stock_only_alerts(app):
+    set_price(app, "000660", 200000)
+    res = await app.rules.propose("x", HYNIX_RULES[1:])
+    await app.pending.resolve(res["pending_id"], "approve")
+    advance(5)
+    (app.settings.data_dir / "sim_overrides.json").write_text(json.dumps({"000660": {"price": 168000, "halted": True}}))
+    await app.engine.tick()
+    assert app.db.q("SELECT * FROM orders") == [] and app.pending.open_items("stoploss_anomaly") == []
+    feed = [m["text"] for m in app.db.q("SELECT text FROM messages")]
+    assert any("거래정지 상태라 매도할 수 없습니다" in t for t in feed)
+
+
+async def test_take_profit_not_asked_during_anomaly(app):
+    set_price(app, "000660", 200000)
+    res = await app.rules.propose("x", HYNIX_RULES[:1])
+    await app.pending.resolve(res["pending_id"], "approve")
+    advance(5); set_price(app, "000660", 240000)
+    await app.engine.tick()
+    assert app.pending.open_items("stoploss_anomaly") == [] and app.db.q("SELECT * FROM orders") == []

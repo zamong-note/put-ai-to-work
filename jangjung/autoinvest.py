@@ -207,7 +207,7 @@ class AutoInvest:
                   (k, timeutil.today_str(), "active" if done else "building", timeutil.now().isoformat()))
         tail = " · 구성 완료, 이제 월 1회 리밸런싱으로 관리합니다." if done else ""
         await self.notifier.send(f"[자동 투자 구성 {k}/{n}회차] 주문 {len(results)}건{tail}\n" +
-                                 "\n".join(results[:12]))
+                                 "\n".join(results[:12]), category="auto")
         return f"{k}/{n}회차 주문 {len(results)}건"
 
     async def _execute(self, plan, source: str, ref: str, reason_fn) -> list[str]:
@@ -275,7 +275,8 @@ class AutoInvest:
         plan, val = await self.rebalance_plan()
         md = timeutil.now().strftime("%m/%d")
         if not plan:
-            await self.notifier.send(f"[리밸런싱 점검 {md}] 모든 비중이 목표 ±{self.cfg['rebalance_band_pp']:g}%p 안 — 조정 없음")
+            await self.notifier.send(f"[리밸런싱 점검 {md}] 모든 비중이 목표 ±{self.cfg['rebalance_band_pp']:g}%p 안 — 조정 없음",
+                                     category="auto")
             return "조정 불필요"
         lines = self._plan_lines(plan)
         if self.rebalance_mode() == "confirm":
@@ -289,7 +290,8 @@ class AutoInvest:
         reasons = {r["symbol"]: f"리밸런싱 · {r['name']} 목표 {r['target']:g}% 대비 {r['dev']:+.1f}%p" for r, _, _ in plan}
         res = await self._execute(plan, "rebalance", timeutil.now().strftime("%Y-%m"),
                                   lambda r, d, f: reasons[r["symbol"]])
-        await self.notifier.send(f"[리밸런싱 알림 {md}]\n" + "\n".join(lines) + "\n— 결과 —\n" + "\n".join(res))
+        await self.notifier.send(f"[리밸런싱 알림 {md}]\n" + "\n".join(lines) + "\n— 결과 —\n" + "\n".join(res),
+                                 category="auto")
         return f"리밸런싱 주문 {len(res)}건"
 
     async def _on_rebalance_confirm(self, action: str, payload: dict, pid: str) -> str:

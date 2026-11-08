@@ -10,6 +10,7 @@ import logging
 
 from . import timeutil
 from .broker.base import BrokerError
+from .rules import is_stop_loss, untradable
 
 log = logging.getLogger("jangjung")
 
@@ -73,6 +74,33 @@ class Engine:
         if self._due("summary", eng["summary_time"]):
             self._mark("summary")
             await self._guard(self.daily_summary(), "장 마감 요약")
+        # 보고서 메일: 그날 장 마감 요약(평가액 기록)이 끝난 뒤에만
+        if (app.db.kv_get("job:summary") == timeutil.today_str()
+                and self._due("report_mail", self.s.report.get("send_time", "16:00"))):
+            self._mark("report_mail")
+            await self.report_mail()
+
+    async def report_mail(self, force_periods: list[str] | None = None) -> str | None:
+        """그날 받을 보고서(일간·주간·월간 중 켠 것)를 설정한 곳(메일·텔레그램)으로 보낸다."""
+        from .pdfreport import channels_for, deliver_reports, due_periods
+        periods = force_periods or due_periods(timeutil.now().date(), self.s.holidays, self.s.report)
+        if not periods:
+            return None
+        channels = channels_for(self.app, self.s.report.get("channel", "both"))
+        if not channels:
+            log.info("보고서를 보낼 곳(메일·텔레그램)이 연결되지 않아 보내지 않음 (%s)", periods)
+            return None
+        try:
+            res = await deliver_reports(self.app, periods, None, channels)
+        except Exception as e:  # noqa: BLE001 — 발송 실패가 매매를 막지 않는다
+            log.warning("보고서 발송 실패: %s", e)
+            self.app.db.kv_set("report_mail_last", {"at": timeutil.now().isoformat(), "periods": periods,
+                                                    "ok": False, "error": str(e)[:300]})
+            await self.app.notifier.send(f"[보고서 발송 실패] {e}\n대시보드 보고서 탭에서 다시 보낼 수 있습니다.")
+            return None
+        await self.app.notifier.send(f"[보고서 발송] {res['message']}",
+                                     category=None if res["errors"] else "report")
+        return res["message"]
 
     async def _guard(self, coro, label: str):
         try:
@@ -122,21 +150,32 @@ class Engine:
             if app.control.halted():
                 return
             sym = r["symbol"]
-            if sym in app.control.suspended():
+            stop_loss = is_stop_loss(r)
+            # 멈춘 종목은 손절 규칙만 계속 본다 (자동으로 팔지는 않고 확인 카드만)
+            if sym in app.control.suspended() and not stop_loss:
                 continue
             if sym not in quotes:
                 q = await app.broker.get_quote(sym)
                 quotes[sym] = q
-                if why := app.control.quote_anomaly(q):
+                if sym not in app.control.suspended() and (why := app.control.quote_anomaly(q)):
                     if app.control.suspend(sym, why):
                         await app.pending.create(
                             "symbol_resume", {"symbol": sym},
                             f"[시세 이상 — {r['name']} 매매 일시중단]\n{why}\n현재가 {q.price:,.0f}원 "
-                            f"(전일 {q.prev_close:,.0f}원)\n이 종목 규칙은 주문하지 않고 기다립니다.",
+                            f"(전일 {q.prev_close:,.0f}원)\n이 종목 규칙은 자동으로 주문하지 않습니다. "
+                            "손절 조건이 충족되면 '그래도 팔까요?'를 따로 묻습니다.",
                             [("이 종목 매매 재개", "approve"), ("계속 중단", "cancel")], ttl_min=7 * 24 * 60)
-                    continue
             q = quotes[sym]
-            if sym in app.control.suspended():
+            if sus := app.control.suspended().get(sym):
+                if stop_loss:
+                    if untradable(q):
+                        if app.rules.evaluate(r, q, acct, app.gateway.ledger.qty(sym)).met:
+                            await self.alert_once(f"sl_halt:{r['id']}",
+                                                  f"규칙 #{r['id']} {r['name']} 손절 조건이 충족됐지만 거래정지 상태라 "
+                                                  "매도할 수 없습니다. 거래가 재개되면 다시 확인합니다.")
+                    else:
+                        await app.rules.stop_loss_during_anomaly(r, q, acct, app.gateway.ledger.qty(sym),
+                                                                 sus["reason"])
                 continue
             ev = app.rules.evaluate(r, q, acct, app.gateway.ledger.qty(sym))
             if ev.met:
@@ -146,6 +185,27 @@ class Engine:
                 acct = await app.broker.get_account()   # 보유 수량 갱신
             elif ev.note == "주문 가능 수량 0주":
                 await self.alert_once(f"zero:{r['id']}", f"규칙 #{r['id']} 조건은 충족했지만 주문 가능 수량이 0주라 실행하지 않았습니다.")
+
+    async def _snapshot_detail(self, val: dict | None) -> str | None:
+        """보고서에서 과거 날짜의 비중·보유 종목을 보여 주기 위한 장 마감 스냅샷."""
+        import json
+        app = self.app
+        out = {}
+        if val:
+            out["auto_rows"] = [{k: r[k] for k in ("symbol", "name", "qty", "price", "value", "weight", "target", "dev")}
+                                for r in val["rows"]]
+            out["cash"] = val["cash"]
+        try:
+            acct = await app.broker.get_account()
+        except BrokerError:
+            acct = None
+        if acct:
+            auto_pos = app.gateway.ledger.positions()
+            out["own"] = [{"symbol": h.symbol, "name": h.name, "qty": h.qty - auto_pos.get(h.symbol, {}).get("qty", 0),
+                           "avg": h.avg_price, "price": h.cur_price} for h in acct.holdings.values()
+                          if h.qty - auto_pos.get(h.symbol, {}).get("qty", 0) > 0]
+            out["account_total"] = acct.total_eval
+        return json.dumps(out, ensure_ascii=False) if out else None
 
     async def daily_summary(self) -> str:
         app = self.app
@@ -184,12 +244,13 @@ class Engine:
             lines.append(f"⛔ 전체 중지 상태: {h['reason']}")
         if app.journal.sheets_error:
             lines.append(f"⚠ Google Sheets 기록 실패(로컬 CSV에는 기록): {app.journal.sheets_error[:80]}")
-        app.db.x("INSERT OR REPLACE INTO daily_snapshots(date,auto_value,auto_principal,rule_fills,active_rules) "
-                 "VALUES(?,?,?,?,?)", (today, val["total"] if val else None,
-                                       val["state"]["principal"] if val else None, fills, remaining))
+        app.db.x("INSERT OR REPLACE INTO daily_snapshots(date,auto_value,auto_principal,rule_fills,active_rules,detail) "
+                 "VALUES(?,?,?,?,?,?)", (today, val["total"] if val else None,
+                                         val["state"]["principal"] if val else None, fills, remaining,
+                                         await self._snapshot_detail(val)))
         await app.journal.log_summary([today, round(val["total"]) if val else "", val["state"]["principal"] if val else "",
                                        f"{val['pnl_pct']:.2f}" if val else "", f"{day_pct:.2f}" if day_pct is not None else "",
                                        fills, remaining, (h or {}).get("reason", "") if (h := app.control.halted()) else ""])
         text = "\n".join(lines)
-        await app.notifier.send(text)
+        await app.notifier.send(text, category="summary")
         return text

@@ -45,19 +45,27 @@ class ConsoleNotifier:
 
 
 class FeedNotifier:
-    def __init__(self, db, inner: Notifier | None = None):
+    """category 가 있는 알림은 설정(notify)에서 끈 경우 텔레그램으로 보내지 않고 기록만 한다.
+    확인 카드(버튼)와 category 없는 알림(안전 경고·실패)은 항상 보낸다."""
+
+    def __init__(self, db, inner: Notifier | None = None, prefs: dict | None = None):
         self.db = db
         self.inner = inner
+        self.prefs = prefs if prefs is not None else {}
 
     def record(self, role: str, text: str, via: str = "", buttons: Buttons | None = None) -> int:
         return self.db.x("INSERT INTO messages(ts,role,via,text,buttons) VALUES(?,?,?,?,?)",
                          (timeutil.now().isoformat(), role, via, text,
                           json.dumps(buttons, ensure_ascii=False) if buttons else None))
 
-    async def send(self, text, buttons=None):
-        fid = self.record("bot", text, buttons=buttons)
+    def muted(self, category: str | None) -> bool:
+        return bool(category) and self.prefs.get(category, "on") == "off"
+
+    async def send(self, text, buttons=None, category: str | None = None):
+        muted = not buttons and self.muted(category)
+        fid = self.record("bot", text, via="muted" if muted else "", buttons=buttons)
         inner_id = None
-        if self.inner is not None:
+        if self.inner is not None and not muted:
             try:
                 inner_id = await self.inner.send(text, buttons)
             except Exception as e:  # noqa: BLE001 — 채널 장애가 매매를 막으면 안 된다

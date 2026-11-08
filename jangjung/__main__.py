@@ -40,6 +40,11 @@ async def run_bot(settings, web: bool = True, port: int = 8765, lan: bool = Fals
     else:
         print("TELEGRAM_BOT_TOKEN 이 없어 텔레그램 없이 실행합니다 (웹 대시보드에서 대화 가능).")
         app = App(settings, console=False)
+    if app.broker.name == "kis-real":
+        warn = ("[실전 계좌] 실제 돈으로 주문합니다. 등록된 규칙·자동 투자가 사용자 확인 없이 체결됩니다. "
+                "멈추려면 '멈춰'.")
+        print("\n  !!! " + warn + "\n")
+        await app.notifier.send(warn)
     tasks.append(app.engine.run())
     if web:
         from .web import serve
@@ -84,9 +89,12 @@ async def run_console(settings, engine: bool = True) -> None:
 
 
 async def check_kis(settings) -> None:
+    """토큰·시세·잔고만 조회한다 (주문하지 않음). BROKER=kis_real 이면 실전 서버로 조회."""
     from .broker.kis import KISBroker
+    real = settings.broker == "kis_real"
+    print(f"{'실전' if real else '모의투자'} 서버로 조회합니다 (주문은 하지 않음)")
     b = KISBroker(settings.kis_app_key, settings.kis_app_secret, settings.kis_account, settings.kis_account_product,
-                  settings.data_dir)
+                  settings.data_dir, real=real)
     try:
         q = await b.get_quote("005930")
         print(f"✅ 시세: 삼성전자 {q.price:,.0f}원 ({q.change_pct:+.2f}%) 상태코드 {q.status_code} 정지 {q.halted}")
@@ -98,9 +106,34 @@ async def check_kis(settings) -> None:
         await b.close()
 
 
+async def make_report(settings, period: str, date: str | None, email: bool) -> None:
+    """PDF 보고서를 data/reports/ 에 저장하고, --email 이면 메일로도 보낸다."""
+    from .app import App
+    from .pdfreport import PERIODS, build_report, email_reports
+    periods = list(PERIODS) if period == "all" else [period]
+    app = App(settings, console=False)
+    try:
+        out = settings.data_dir / "reports"
+        out.mkdir(exist_ok=True)
+        for p in periods:
+            rep = await build_report(app, p, date)
+            (out / rep.filename).write_bytes(rep.pdf)
+            print(f"[완료] {rep.title} · {rep.pages}장 -> {out / rep.filename}")
+        if email:
+            print("[메일] " + await email_reports(app, periods, date))
+    finally:
+        await app.close()
+
+
 def main() -> None:
+    for stream in (sys.stdout, sys.stderr):      # Windows 콘솔(cp949)에서 이모지 때문에 죽지 않도록
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     p = argparse.ArgumentParser(prog="jangjung")
-    p.add_argument("cmd", choices=["run", "web", "demo", "chat", "check-kis", "update-master", "sim-price", "audit"])
+    p.add_argument("cmd", choices=["run", "web", "demo", "chat", "check-kis", "update-master", "sim-price", "audit",
+                                      "report"])
     p.add_argument("args", nargs="*")
     p.add_argument("--no-engine", action="store_true")
     p.add_argument("--clear", action="store_true")
@@ -108,15 +141,24 @@ def main() -> None:
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--lan", action="store_true", help="같은 Wi-Fi의 휴대폰에서 접속 (PIN 로그인)")
     p.add_argument("--halt", action="store_true")
+    p.add_argument("--email", action="store_true", help="report: 만든 PDF를 메일로 보냄")
+    p.add_argument("--demo", action="store_true", help="report: 데모 기록(data/demo)으로 만듦")
     a = p.parse_args()
     settings = load_settings()
+    if a.cmd == "report" and a.demo:
+        settings = load_settings(settings.data_dir / "demo")
+        settings.broker = "sim"
     _setup_logging(settings.data_dir)
 
     if a.cmd in ("run", "web"):
+        from .app import RealTradingLocked
         try:
             asyncio.run(run_bot(settings, web=not a.no_web, port=a.port, lan=a.lan))
         except KeyboardInterrupt:
             pass
+        except RealTradingLocked as e:
+            print(f"\n[실행 중단] {e}\n")
+            sys.exit(2)
     elif a.cmd == "demo":
         from .demo import seed
         demo_dir = settings.data_dir / "demo"
@@ -153,6 +195,11 @@ def main() -> None:
             ov[sym] = float(a.args[1])
         path.write_text(json.dumps(ov), encoding="utf-8")
         print(ov)
+    elif a.cmd == "report":
+        period = (a.args[0] if a.args else "daily").lower()
+        if period not in ("daily", "weekly", "monthly", "all"):
+            p.error("report daily|weekly|monthly|all [YYYY-MM-DD] [--email]")
+        asyncio.run(make_report(settings, period, a.args[1] if len(a.args) > 1 else None, a.email))
     elif a.cmd == "audit":
         from .audit import audit
         from .db import DB

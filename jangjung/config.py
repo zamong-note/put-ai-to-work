@@ -38,6 +38,10 @@ class Settings:
     google_sa_file: str = ""
     google_sheet_id: str = ""
     claude_model: str = "claude-opus-5-5"
+    report: dict = field(default_factory=lambda: {"email_daily": "on", "email_weekly": "on", "email_monthly": "on",
+                                                  "channel": "both", "send_time": "16:00"})
+    notify: dict = field(default_factory=lambda: {"fill": "on", "auto": "on", "summary": "on", "settings": "on",
+                                                  "report": "on"})
     extra: dict = field(default_factory=dict)
 
 
@@ -64,6 +68,7 @@ def load_settings(data_dir: str | Path | None = None) -> Settings:
         google_sheet_id=os.getenv("GOOGLE_SHEET_ID", ""),
         claude_model=os.getenv("CLAUDE_MODEL", "claude-opus-5-5") or "claude-opus-5-5",
         extra={"defaults": copy.deepcopy(s)},
+        **{k: s[k] for k in ("report", "notify") if k in s},
     )
     from .settings_store import load_overrides   # 화면에서 바꾼 값(data/settings.local.json) 반영
     load_overrides(st)

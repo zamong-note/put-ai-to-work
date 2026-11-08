@@ -5,6 +5,7 @@ import logging
 import math
 import secrets
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from . import timeutil
 from .broker.base import Account, Quote
@@ -20,6 +21,16 @@ CONDITIONS = {
     "return_at_or_below": ("수익률", "≤"),
 }
 QTY_MODES = {"shares", "fraction", "amount"}
+
+
+def is_stop_loss(r: dict) -> bool:
+    """손절 규칙 = 가격/수익률이 '이하'가 되면 파는 규칙."""
+    return r["side"] == "sell" and r["condition"].endswith("below")
+
+
+def untradable(q: Quote) -> bool:
+    """거래정지 등 주문 자체가 불가능한 시세."""
+    return bool(q.halted) or q.status_code == "58" or not q.price
 
 
 def cond_text(condition: str, threshold: float) -> str:
@@ -60,6 +71,7 @@ class RuleService:
         pending.register("rules_add", self._on_rules_add)
         pending.register("rule_change", self._on_rule_change)
         pending.register("order_over_limit", self._on_order_over_limit)
+        pending.register("stoploss_anomaly", self._on_stoploss_anomaly)
 
     # ── 조회 ──
     def list(self, include_inactive: bool = False) -> list[dict]:
@@ -232,7 +244,8 @@ class RuleService:
             return Evaluation(False, metric, 0, "주문 가능 수량 0주")
         return Evaluation(True, metric, qty)
 
-    async def fire(self, r: dict, ev: Evaluation, q: Quote, detected_at: str, confirmed: bool = False) -> str:
+    async def fire(self, r: dict, ev: Evaluation, q: Quote, detected_at: str, confirmed: bool = False,
+                   anomaly_override: str | None = None) -> str:
         metric_txt = f"현재 {ev.metric:,.0f}원" if r["condition"].startswith("price") else f"현재 {ev.metric:+.1f}%"
         reason = f"규칙 #{r['id']} '{cond_text(r['condition'], r['threshold'])}' 충족 ({metric_txt}) → " \
                  f"{qty_text(r['side'], r['qty_mode'], r['qty_value'])}"
@@ -241,7 +254,10 @@ class RuleService:
                           "metric": ev.metric, "quote": {"price": q.price, "prev_close": q.prev_close,
                                                          "change_pct": q.change_pct}},
                          detected_at)
-        out = await self.gw.submit(it, confirmed_over_limit=confirmed)
+        if anomaly_override:
+            it.reason += " · 시세 이상 중 사용자 확인 후 매도"
+            it.evidence["anomaly_override"] = anomaly_override
+        out = await self.gw.submit(it, confirmed_over_limit=confirmed, allow_suspended=bool(anomaly_override))
         now = timeutil.now().isoformat()
         if out.status == "needs_confirm":
             self.db.x("UPDATE rules SET status='waiting_confirm', updated_at=? WHERE id=?", (now, r["id"]))
@@ -296,6 +312,77 @@ class RuleService:
         if not ev.met:
             self.db.x("UPDATE rules SET status='active', updated_at=? WHERE id=?", (timeutil.now().isoformat(), r["id"]))
             return "확인하는 사이 조건이 더 이상 충족되지 않아 주문하지 않았습니다. 규칙은 계속 감시합니다."
+        self._set_status(r["id"], "active")
         r["status"] = "active"
         res = await self.fire(r, ev, q, timeutil.now().isoformat(), confirmed=True)
         return f"주문 처리: {res}"
+
+    def _set_status(self, rule_id: int, status: str, note: str | None = None) -> None:
+        if note is None:
+            self.db.x("UPDATE rules SET status=?, updated_at=? WHERE id=?", (status, timeutil.now().isoformat(), rule_id))
+        else:
+            self.db.x("UPDATE rules SET status=?, note=?, updated_at=? WHERE id=?",
+                      (status, note, timeutil.now().isoformat(), rule_id))
+
+    # ── 시세 이상 중 손절: 자동으로 팔지 않고 '그래도 팔까요?' 확인 ──
+    def _held_until(self, rule_id: int) -> datetime | None:
+        v = self.db.kv_get(f"sl_hold:{rule_id}")
+        return datetime.fromisoformat(v) if v else None
+
+    async def stop_loss_during_anomaly(self, r: dict, q: Quote, acct: Account, auto_qty: int, why: str) -> str | None:
+        """종목이 시세 이상으로 멈춘 동안 손절 조건이 충족되면 확인 카드를 보낸다. 카드를 보냈으면 'card'."""
+        if not is_stop_loss(r) or untradable(q):
+            return None
+        hold = self._held_until(r["id"])
+        if hold and timeutil.now() < hold:
+            return None
+        ev = self.evaluate(r, q, acct, auto_qty)
+        if not ev.met:
+            return None
+        ttl = int(self.settings.engine.get("stop_loss_card_ttl_min", 30))
+        metric_txt = f"현재 {ev.metric:,.0f}원" if r["condition"].startswith("price") else f"현재 {ev.metric:+.1f}%"
+        issues = self.gw.limit_issues("sell", ev.qty * q.price)
+        self._set_status(r["id"], "waiting_confirm", "시세 이상 — 손절 매도 확인 대기")
+        await self.pending.create(
+            "stoploss_anomaly", {"rule_id": r["id"], "why": why},
+            f"[시세 이상 중 손절 조건 충족 — 그래도 팔까요?]\n"
+            f"{r['name']} · 규칙 #{r['id']} '{cond_text(r['condition'], r['threshold'])}' 충족 ({metric_txt})\n"
+            f"매도 {ev.qty}주 · 약 {ev.qty * q.price:,.0f}원 (현재가 {q.price:,.0f}원, 전일 대비 {q.change_pct:+.1f}%)\n"
+            f"자동 매매를 멈춘 이유: {why}\n"
+            "⚠ 시장가 주문이라 급변 중에는 체결가가 지금 가격과 크게 다를 수 있습니다.\n"
+            + "".join(f"⛔ {i}\n" for i in issues) +
+            f"'오늘은 보류'를 누르면 오늘은 다시 묻지 않습니다. {ttl}분 안에 답이 없으면 팔지 않고, "
+            "조건이 계속 충족되면 다시 묻습니다.",
+            [("그래도 매도", "sell"), ("오늘은 보류", "hold")], ttl_min=ttl)
+        return "card"
+
+    async def _on_stoploss_anomaly(self, action: str, payload: dict, pid: str) -> str:
+        r = self.db.one("SELECT * FROM rules WHERE id=?", (payload["rule_id"],))
+        if not r or r["status"] != "waiting_confirm":
+            return "규칙 상태가 바뀌어 실행하지 않았습니다."
+        if action == "hold":
+            tomorrow = (timeutil.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+            self.db.kv_set(f"sl_hold:{r['id']}", tomorrow.isoformat())
+            self._set_status(r["id"], "active", "시세 이상 중 손절 보류 (오늘)")
+            return (f"팔지 않았습니다. 규칙 #{r['id']}는 계속 감시하지만 오늘은 다시 묻지 않습니다.\n"
+                    "※ 이 종목 매매를 재개하면 그때부터는 조건 충족 시 바로 매도합니다.")
+        if action != "sell":   # 만료
+            self._set_status(r["id"], "active", "시세 이상 중 손절 확인 만료")
+            return "답이 없어 팔지 않았습니다. 조건이 계속 충족되면 다시 묻습니다."
+        self._set_status(r["id"], "active")
+        q = await self.broker.get_quote(r["symbol"])
+        if untradable(q):
+            return "지금은 거래정지 상태라 매도할 수 없습니다. 규칙은 계속 감시합니다."
+        acct = await self.broker.get_account()
+        ev = self.evaluate(r, q, acct, self.gw.ledger.qty(r["symbol"]))
+        if not ev.met:
+            return "확인하는 사이 손절 조건이 더 이상 충족되지 않아 팔지 않았습니다. 규칙은 계속 감시합니다."
+        r["status"] = "active"
+        res = await self.fire(r, ev, q, timeutil.now().isoformat(), confirmed=True,
+                              anomaly_override=payload.get("why") or "시세 이상")
+        label = {"filled": "체결", "partial": "일부 체결", "submitted": "접수", "blocked": "주문 차단",
+                 "failed": "주문 실패"}.get(res, res)
+        if res == "blocked":
+            note = self.db.one("SELECT note FROM rules WHERE id=?", (r["id"],))["note"]
+            return f"손절 매도 처리: {label} — {note}"
+        return f"손절 매도 처리: {label}"

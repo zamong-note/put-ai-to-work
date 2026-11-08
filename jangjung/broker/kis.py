@@ -1,6 +1,7 @@
-"""한국투자증권 KIS Open API — 모의투자 전용 클라이언트.
+"""한국투자증권 KIS Open API 클라이언트 — 모의투자(기본) / 실전.
 
-이번 챌린지는 모의투자 계좌로만 운영하므로 실전 도메인은 코드에 넣지 않았다.
+실전은 BROKER=kis_real 과 KIS_REAL_TRADING=yes 가 .env 에 함께 있을 때만 쓴다 (App._make_broker).
+모의와 실전은 도메인과 주문·잔고·체결조회 TR ID만 다르다.
 참고: https://apiportal.koreainvestment.com , https://github.com/koreainvestment/open-trading-api
 """
 from __future__ import annotations
@@ -17,35 +18,47 @@ from .. import timeutil
 from .base import Account, BrokerError, BrokerNetworkError, BrokerRejected, FillStatus, Holding, OrderResult, Quote
 
 MOCK_BASE = "https://openapivts.koreainvestment.com:29443"
+REAL_BASE = "https://openapi.koreainvestment.com:9443"
 
 TR = {
-    "price": "FHKST01010100",        # 주식현재가 시세
+    "price": "FHKST01010100",        # 주식현재가 시세 (모의·실전 공통)
     "buy": "VTTC0012U",              # 모의 현금 매수 (구 VTTC0802U)
     "sell": "VTTC0011U",             # 모의 현금 매도 (구 VTTC0801U)
     "balance": "VTTC8434R",          # 모의 잔고조회
     "ccld": ["VTTC0081R", "VTTC8001R"],  # 모의 일별주문체결조회 (신/구)
 }
 LEGACY_ORDER_TR = {"buy": "VTTC0802U", "sell": "VTTC0801U"}
+TR_REAL = {
+    "price": "FHKST01010100",
+    "buy": "TTTC0012U",              # 실전 현금 매수 (구 TTTC0802U)
+    "sell": "TTTC0011U",             # 실전 현금 매도 (구 TTTC0801U)
+    "balance": "TTTC8434R",          # 실전 잔고조회
+    "ccld": ["TTTC0081R", "TTTC8001R"],  # 실전 일별주문체결조회 (3개월 이내, 신/구)
+}
+LEGACY_ORDER_TR_REAL = {"buy": "TTTC0802U", "sell": "TTTC0801U"}
 TOKEN_ERRORS = {"EGW00123", "EGW00121"}
 
 
 class KISBroker:
-    name = "kis-mock"
-
     def __init__(self, app_key: str, app_secret: str, account: str, product: str, data_dir: Path,
-                 min_interval: float = 0.6):
+                 min_interval: float | None = None, real: bool = False):
         if not (app_key and app_secret and account):
             raise BrokerError("KIS_APP_KEY / KIS_APP_SECRET / KIS_ACCOUNT 가 .env 에 없습니다")
+        self.real = real
+        self.name = "kis-real" if real else "kis-mock"
+        self.tr = TR_REAL if real else TR
+        self.legacy_tr = LEGACY_ORDER_TR_REAL if real else LEGACY_ORDER_TR
         self.app_key, self.app_secret = app_key, app_secret
         self.cano, self.prdt = account[:8], product
-        self.token_path = data_dir / "kis_token.json"
-        self.http = httpx.AsyncClient(base_url=MOCK_BASE, timeout=10)
+        self.token_path = data_dir / ("kis_token_real.json" if real else "kis_token.json")   # 토큰을 섞지 않음
+        self.http = httpx.AsyncClient(base_url=REAL_BASE if real else MOCK_BASE, timeout=10)
         self._lock = asyncio.Lock()
         self._last = 0.0
-        self._min_interval = min_interval  # 모의투자 초당 호출 제한 대응
+        # 초당 호출 제한: 모의 약 2건, 실전 약 20건 → 여유 있게
+        self._min_interval = min_interval if min_interval is not None else (0.12 if real else 0.6)
         self._token: str | None = None
         self._token_exp: datetime | None = None
-        self._ccld_tr = TR["ccld"][0]
+        self._ccld_tr = self.tr["ccld"][0]
 
     # ── 인증 ──
     async def _get_token(self, force: bool = False) -> str:
@@ -100,7 +113,7 @@ class KISBroker:
 
     # ── 시세 ──
     async def get_quote(self, symbol: str) -> Quote:
-        d, _ = await self._call("GET", "/uapi/domestic-stock/v1/quotations/inquire-price", TR["price"],
+        d, _ = await self._call("GET", "/uapi/domestic-stock/v1/quotations/inquire-price", self.tr["price"],
                                 params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol})
         o = d.get("output") or {}
         price = float(o.get("stck_prpr") or 0)
@@ -120,7 +133,7 @@ class KISBroker:
         summary: dict = {}
         tr_cont = ""
         for _ in range(10):
-            d, h = await self._call("GET", "/uapi/domestic-stock/v1/trading/inquire-balance", TR["balance"],
+            d, h = await self._call("GET", "/uapi/domestic-stock/v1/trading/inquire-balance", self.tr["balance"],
                                     params=params, tr_cont=tr_cont)
             for row in d.get("output1") or []:
                 qty = int(float(row.get("hldg_qty") or 0))
@@ -149,14 +162,14 @@ class KISBroker:
         if side == "sell":
             body["SLL_TYPE"] = "01"
         try:
-            d, _ = await self._call("POST", "/uapi/domestic-stock/v1/trading/order-cash", TR[side], body=body)
+            d, _ = await self._call("POST", "/uapi/domestic-stock/v1/trading/order-cash", self.tr[side], body=body)
         except BrokerRejected as e:
             # API가 명시적으로 거절한 경우에만(접수 안 됨이 확실) 구 TR로 한 번 재시도.
             # 네트워크 오류(BrokerNetworkError)는 접수 여부를 알 수 없으므로 재시도하지 않는다 → 이중주문 방지
             if not any(k in str(e) for k in ("TR", "tr_id", "EGW0")):
                 raise
             d, _ = await self._call("POST", "/uapi/domestic-stock/v1/trading/order-cash",
-                                    LEGACY_ORDER_TR[side], body=body)
+                                    self.legacy_tr[side], body=body)
         o = d.get("output") or {}
         return OrderResult(True, str(o.get("ODNO") or o.get("odno") or ""), d.get("msg1", "").strip())
 
@@ -170,9 +183,9 @@ class KISBroker:
             d, _ = await self._call("GET", "/uapi/domestic-stock/v1/trading/inquire-daily-ccld", self._ccld_tr,
                                     params=params)
         except BrokerError:
-            if self._ccld_tr == TR["ccld"][1]:
+            if self._ccld_tr == self.tr["ccld"][1]:
                 raise
-            self._ccld_tr = TR["ccld"][1]
+            self._ccld_tr = self.tr["ccld"][1]
             d, _ = await self._call("GET", "/uapi/domestic-stock/v1/trading/inquire-daily-ccld", self._ccld_tr,
                                     params=params)
         for row in d.get("output1") or []:

@@ -29,6 +29,22 @@
     "min_trade_dev_pp": 1.0,
     "rebalance_mode": "auto"
   },
+  "report": {
+    "_comment": "장 마감 요약 뒤 send_time 에 PDF 보고서를 보낸다 (channel: email | telegram | both). 주간 = 그 주 마지막 거래일, 월간 = 그 달 마지막 거래일. 연결되지 않은 곳으로는 보내지 않는다.",
+    "email_daily": "on",
+    "email_weekly": "on",
+    "email_monthly": "on",
+    "channel": "both",
+    "send_time": "16:00"
+  },
+  "notify": {
+    "_comment": "off 로 바꾼 알림은 텔레그램으로 보내지 않고 대시보드 '대화·알림'에만 남긴다. 확인 카드·안전 경고·실패 알림은 항상 보낸다.",
+    "fill": "on",
+    "auto": "on",
+    "summary": "on",
+    "settings": "on",
+    "report": "on"
+  },
   "sim": {
     "initial_cash": 11200000,
     "initial_holdings": {"000660": {"qty": 20, "avg_price": 190000}},
