@@ -24,7 +24,7 @@ from email.message import EmailMessage
 from email.utils import formataddr
 from pathlib import Path
 
-from . import timeutil
+from . import markets, timeutil
 from .audit import audit
 from .broker.base import BrokerError
 from .report import SOURCE, STATUS, orders_csv
@@ -145,7 +145,7 @@ async def collect(app, period: str, end: str) -> dict:
         if auto and det.get("auto_rows"):
             auto["rows"], auto["cash"] = det["auto_rows"], det.get("cash")
         if det.get("own") is not None:
-            own = sorted((dict(o, value=o["qty"] * o["price"],
+            own = sorted((dict(o, value=markets.to_krw(o["qty"] * o["price"], o["symbol"], app.settings.overseas),
                                ret=(o["price"] / o["avg"] - 1) * 100 if o["avg"] else None) for o in det["own"]),
                          key=lambda x: -x["value"])
     if live_acct:
@@ -155,7 +155,7 @@ async def collect(app, period: str, end: str) -> dict:
             q = h.qty - auto_pos.get(h.symbol, {}).get("qty", 0)
             if q > 0:
                 own.append({"name": h.name, "symbol": h.symbol, "qty": q, "avg": h.avg_price, "price": h.cur_price,
-                            "value": q * h.cur_price,
+                            "value": markets.to_krw(q * h.cur_price, h.symbol, app.settings.overseas),
                             "ret": (h.cur_price / h.avg_price - 1) * 100 if h.avg_price else None})
         own.sort(key=lambda x: -x["value"])
 
@@ -171,6 +171,7 @@ async def collect(app, period: str, end: str) -> dict:
                      "src": o["source"], "name": o["name"], "side": o["side"], "qty": o["qty"],
                      "filled": o["filled_qty"] or 0, "decision": o["decision_price"], "fill": o["avg_fill_price"],
                      "gap": gap, "lat": lat, "status": o["status"], "status_label": STATUS.get(o["status"], o["status"]),
+                     "symbol": o["symbol"], "fx": o.get("fx") or 1,
                      "reason": o["reason"] or "", "error": o["error"] or ""})
     done = [r for r in rows if r["status"] in ("filled", "partial")]
     by_sym: dict[str, dict] = {}
@@ -180,10 +181,10 @@ async def collect(app, period: str, end: str) -> dict:
         k = "buy" if r["side"] == "buy" else "sell"
         b[f"{k}_n"] += 1
         b[f"{k}_q"] += r["filled"]
-        b[f"{k}_amt"] += r["filled"] * (r["fill"] or 0)
+        b[f"{k}_amt"] += r["filled"] * (r["fill"] or 0) * r["fx"]
     trades = sorted(by_sym.values(), key=lambda b: -(b["buy_amt"] + b["sell_amt"]))
-    buy_amt = sum(r["filled"] * (r["fill"] or 0) for r in done if r["side"] == "buy")
-    sell_amt = sum(r["filled"] * (r["fill"] or 0) for r in done if r["side"] == "sell")
+    buy_amt = sum(r["filled"] * (r["fill"] or 0) * r["fx"] for r in done if r["side"] == "buy")
+    sell_amt = sum(r["filled"] * (r["fill"] or 0) * r["fx"] for r in done if r["side"] == "sell")
     gaps = [r["gap"] for r in done if r["gap"] is not None]
     lats = [r["lat"] for r in rows if r["lat"] is not None]
     counts = {
@@ -282,6 +283,7 @@ async def collect(app, period: str, end: str) -> dict:
         "generated_at": timeutil.now().strftime("%Y-%m-%d %H:%M"),
         "broker": BROKER_NAMES.get(app.broker.name, app.broker.name),
         "live": live_val is not None or live_acct is not None,
+        "strategies": _strategies(app, start, end), "fx": _fx(app),
         "auto": auto, "series": series, "own": own, "orders": rows, "counts": counts, "trades": trades,
         "as_of": as_of,
         "violations": violations, "events": events, "ev_count": ev_count, "changes": changes,
@@ -289,6 +291,36 @@ async def collect(app, period: str, end: str) -> dict:
         "rules": [rule_line(r) for r in app.rules.list()],
         "halted": app.control.halted(),
     }
+
+
+def _strategies(app, start: str, end: str) -> list[dict]:
+    try:
+        rows = app.db.q("SELECT id, created_at, status, base, before, targets, result, note FROM strategies "
+                        "WHERE substr(created_at,1,10) BETWEEN ? AND ? ORDER BY id", (start, end))
+    except Exception:  # noqa: BLE001 — 오래된 DB
+        return []
+    out = []
+    for r in rows:
+        res = json.loads(r["result"] or "{}")
+        before, targets = json.loads(r["before"] or "{}"), json.loads(r["targets"] or "null")
+        changes = []
+        if targets:
+            for s in sorted(set(before) | set(targets), key=lambda x: -(targets.get(x, 0))):
+                if abs(before.get(s, 0) - targets.get(s, 0)) >= 0.5:
+                    changes.append(f"{app.universe.name(s)} {before.get(s, 0):g}%→{targets.get(s, 0):g}%")
+        out.append({"id": r["id"], "at": r["created_at"][5:16].replace("T", " "), "status": r["status"],
+                    "summary": res.get("summary", ""), "confidence": res.get("confidence"),
+                    "views": res.get("country_views", []), "changes": changes, "note": r["note"]})
+    return out
+
+
+def _fx(app) -> dict:
+    from .macro import fx_summary
+    return {"rates": fx_summary(app.db, app.settings.overseas), "last": app.db.kv_get("fx_last")}
+
+
+STRATEGY_STATUS = {"proposed": "확인 대기", "executed": "실행함", "approved": "장 시작 후 실행", "declined": "건너뜀",
+                   "no_change": "변경 없음", "analysis": "점검만", "rejected": "제안 거부(범위 밖)", "skipped": "실행 안 함"}
 
 
 def highlights(d: dict) -> list[str]:
@@ -318,6 +350,10 @@ def highlights(d: dict) -> list[str]:
     if c["avg_gap"] is not None:
         chk += f" · 체결가 괴리 평균 {0 if abs(c['avg_gap']) < 0.005 else c['avg_gap']:+.2f}%"
     out.append(chk)
+    if d.get("strategies"):
+        ss = d["strategies"]
+        ex = sum(1 for s in ss if s["status"] == "executed")
+        out.append(f"AI 투자 점검 {len(ss)}회 · 비중 조정 실행 {ex}회 · 최근: {STRATEGY_STATUS.get(ss[-1]['status'], ss[-1]['status'])}")
     return out
 
 
@@ -327,6 +363,13 @@ def _won(v) -> str:
 
 def _num(v) -> str:
     return "—" if v is None else f"{v:,.0f}"
+
+
+def _px(symbol: str, v) -> str:
+    """국내는 숫자만, 해외는 현지 통화 표기."""
+    if v is None:
+        return "—"
+    return markets.fmt_price(symbol, v) if markets.is_overseas(symbol) else f"{v:,.0f}"
 
 
 def _spct(v) -> str:
@@ -613,7 +656,8 @@ def render_pdf(d: dict, max_orders: int | None = None, max_events: int | None = 
     if d["own"] is not None:
         story.append(P(f"직접 보유 종목 (자동 투자 몫 제외 · 규칙 매매 대상 · {d['as_of'] or ''})", st["h3"]))
         if d["own"]:
-            rows = [[cell(o["name"]), cell(f"{o['qty']:,}주", True), cell(_num(o["avg"]), True), cell(_num(o["price"]), True),
+            rows = [[cell(o["name"]), cell(f"{o['qty']:,}주", True), cell(_px(o["symbol"], o["avg"]), True),
+                     cell(_px(o["symbol"], o["price"]), True),
                      cell(_num(o["value"]), True), cell(_signed(o["ret"]), True)] for o in d["own"]]
             story.append(table(["종목", "수량", "평균 매수가", "현재가", "평가액(원)", "수익률"], rows,
                                [W * 0.3, W * 0.12, W * 0.15, W * 0.13, W * 0.16, W * 0.14]))
@@ -635,7 +679,7 @@ def render_pdf(d: dict, max_orders: int | None = None, max_events: int | None = 
             if o["status"] in ("failed", "rejected"):
                 stat = f'<font color="{CRIT}">{_clean(stat)}</font>'
             rows.append([cell(o["at"]), cell(o["source"]), cell(o["name"]), cell(side), cell(f"{o['qty']:,}", True),
-                         cell(_num(o["decision"]), True), cell(_num(o["fill"]), True),
+                         cell(_px(o["symbol"], o["decision"]), True), cell(_px(o["symbol"], o["fill"]), True),
                          cell("—" if o["gap"] is None else f"{o['gap']:+.2f}%", True), cell(stat)])
             reason = "근거: " + o["reason"] + (f" · 오류: {o['error']}" if o["error"] else "")
             rows.append([P(_clean(reason), st["small"])] + [""] * 8)
@@ -665,6 +709,38 @@ def render_pdf(d: dict, max_orders: int | None = None, max_events: int | None = 
             block.append(P(_clean(f"최근 {len(ev_shown)}건만 표시"), st["small"]))
     else:
         block.append(P("전체 중지·시세 이상·한도 초과·손실 한도 등 안전 장치가 작동한 기록이 없습니다.", st["body"]))
+    story += block
+
+    # AI 투자 점검 · 환율
+    sts = d.get("strategies") or []
+    block = [CondPageBreak(45 * mm), P(f"AI 투자 점검 · 환율 ({len(sts)}회)", st["h2"])]
+    if sts:
+        s = sts[-1]
+        block.append(P(_clean(f"최근 #{s['id']} · {s['at']} · {STRATEGY_STATUS.get(s['status'], s['status'])} · 확신도 "
+                              f"{s['confidence'] or '-'}"), st["meta"]))
+        block.append(P(_clean(s["summary"]), st["body"]))
+        for v in s["views"][:6]:
+            block.append(P(_clean(f"{v.get('country')} {v.get('view')}: {v.get('reason')}"), st["bullet"], bulletText="•"))
+        if s["changes"]:
+            block.append(P(_clean("목표 비중: " + ", ".join(s["changes"])), st["body"]))
+        if s["note"]:
+            block.append(P(_clean("※ " + s["note"]), st["small"]))
+        if len(sts) > 1:
+            block.append(P(_clean("이 기간 점검: " + " / ".join(f"#{x['id']} {x['at'][:5]} {STRATEGY_STATUS.get(x['status'], x['status'])}"
+                                                               for x in sts[-8:])), st["small"]))
+    else:
+        block.append(P("이 기간에는 AI 투자 점검 기록이 없습니다.", st["body"]))
+    fx = d.get("fx") or {}
+    if fx.get("rates"):
+        rows = [[cell(c), cell(f"{v['krw_per_unit']:,.4g}원", True),
+                 cell(_signed(v["chg_1d_pct"]) if v["chg_1d_pct"] is not None else "—", True),
+                 cell(_signed(v["chg_30d_pct"]) if v["chg_30d_pct"] is not None else "—", True)]
+                for c, v in fx["rates"].items()]
+        block.append(Spacer(1, 4))
+        block.append(table(["통화", "1단위 환율", "1일", "30일"], rows, [W * 0.2, W * 0.3, W * 0.25, W * 0.25]))
+        last = fx.get("last")
+        block.append(P(_clean(f"환율 출처 {last['source']} · 갱신 {last['at'][:16].replace('T', ' ')}" if last
+                              else "환율: 설정의 근사값 (자동 갱신 기록 없음)"), st["small"]))
     story += block
 
     # 규칙 현황 + 점검 + 설정

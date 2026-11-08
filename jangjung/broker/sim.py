@@ -2,7 +2,8 @@
 
 - 가격: 기준가 주변 랜덤워크. data/sim_overrides.json 으로 특정 종목 가격/거래정지를 강제할 수 있다
   예) {"000660": 230000, "005930": {"price": 70000, "halted": true}}
-- 체결: 시장가는 즉시 현재가 체결
+- 체결: 시장가는 즉시 현재가 체결, 지정가는 현재가보다 유리하면 현재가로 체결
+- 해외 종목('NASD:AAPL'): 현지 통화 가격, 매수 대금은 원화 현금에서 근사 환율로 차감 (통합증거금 가정)
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import json
 import random
 from pathlib import Path
 
-from .. import timeutil
+from .. import markets, timeutil
 from ..db import DB
 from .base import Account, BrokerError, FillStatus, Holding, OrderResult, Quote
 
@@ -23,7 +24,19 @@ BASE_PRICES = {
 }
 
 
-def _tick(price: float) -> float:
+BASE_PRICES_OVERSEAS = {
+    "NASD:AAPL": 230, "NASD:MSFT": 420, "NASD:NVDA": 140, "NASD:AMZN": 200, "NASD:GOOGL": 170, "NASD:META": 560,
+    "NASD:TSLA": 250, "NASD:QQQ": 500, "AMEX:SPY": 570, "AMEX:VOO": 520, "NYSE:JPM": 220, "NYSE:KO": 70,
+    "NASD:TQQQ": 75, "NASD:SQQQ": 30, "TKSE:7203": 2800, "TKSE:6758": 3300, "TKSE:9984": 9000,
+    "SHAA:600519": 1500, "SZAA:300750": 250, "SZAA:000858": 130, "SEHK:00700": 400, "SEHK:09988": 90,
+    "SEHK:03690": 150, "VNSE:VNM": 65000, "VNSE:VCB": 90000, "VNSE:FPT": 130000,
+}
+
+
+def _tick(price: float, symbol: str = "") -> float:
+    if markets.is_overseas(symbol):
+        st = markets.tick(symbol, price)
+        return round(max(st, round(price / st) * st), 3)
     """한국 주식 호가단위 근사."""
     step = 1 if price < 2000 else 5 if price < 5000 else 10 if price < 20000 else 50 if price < 50000 \
         else 100 if price < 200000 else 500 if price < 500000 else 1000
@@ -33,8 +46,9 @@ def _tick(price: float) -> float:
 class SimBroker:
     name = "sim"
 
-    def __init__(self, db: DB, names, cfg: dict, data_dir: Path):
+    def __init__(self, db: DB, names, cfg: dict, data_dir: Path, overseas_cfg: dict | None = None):
         self.db = db
+        self.overseas_cfg = overseas_cfg if overseas_cfg is not None else {}
         self.names = names
         self.vol = cfg.get("volatility_pct", 0.15) / 100
         self.override_path = data_dir / "sim_overrides.json"
@@ -70,9 +84,9 @@ class SimBroker:
         today = timeutil.today_str()
         p = st["prices"].get(symbol)
         if p is None or p.get("date") != today:
-            base = p["price"] if p else BASE_PRICES.get(symbol) or (
+            base = p["price"] if p else BASE_PRICES.get(symbol) or BASE_PRICES_OVERSEAS.get(symbol) or (
                 10000 + int(hashlib.md5(symbol.encode()).hexdigest(), 16) % 90000)
-            p = {"price": _tick(base), "prev_close": _tick(base), "date": today}
+            p = {"price": _tick(base, symbol), "prev_close": _tick(base, symbol), "date": today}
         ov = self._overrides().get(symbol)
         halted = False
         if ov is not None:
@@ -83,12 +97,12 @@ class SimBroker:
             else:
                 p["price"] = float(ov)
         else:
-            p["price"] = _tick(p["price"] * (1 + random.gauss(0, self.vol)))
+            p["price"] = _tick(p["price"] * (1 + random.gauss(0, self.vol)), symbol)
         st["prices"][symbol] = p
         self._save(st)
         chg = (p["price"] / p["prev_close"] - 1) * 100
         return Quote(symbol, p["price"], p["prev_close"], round(chg, 2), halted, "58" if halted else "00",
-                     timeutil.now())
+                     timeutil.now(), markets.currency_of(symbol))
 
     async def get_account(self) -> Account:
         self._check_fail()
@@ -98,9 +112,10 @@ class SimBroker:
         for sym, h in st["holdings"].items():
             if h["qty"] <= 0:
                 continue
-            cur = st["prices"].get(sym, {}).get("price") or BASE_PRICES.get(sym, h["avg_price"])
-            holdings[sym] = Holding(sym, self.names(sym), h["qty"], h["avg_price"], cur)
-            total += cur * h["qty"]
+            cur = st["prices"].get(sym, {}).get("price") or BASE_PRICES.get(sym) or BASE_PRICES_OVERSEAS.get(
+                sym, h["avg_price"])
+            holdings[sym] = Holding(sym, self.names(sym), h["qty"], h["avg_price"], cur, markets.currency_of(sym))
+            total += markets.to_krw(cur * h["qty"], sym, self.overseas_cfg)
         return Account(st["cash"], holdings, total)
 
     async def place_order(self, symbol, side, qty, order_type, price) -> OrderResult:
@@ -118,17 +133,17 @@ class SimBroker:
         h = st["holdings"].setdefault(symbol, {"qty": 0, "avg_price": 0})
         if fill is not None:
             if side == "buy":
-                cost = fill * qty
+                cost = markets.to_krw(fill * qty, symbol, self.overseas_cfg)
                 if cost > st["cash"]:
                     return OrderResult(False, message="주문가능금액 부족")
                 st["cash"] -= cost
-                h["avg_price"] = (h["avg_price"] * h["qty"] + cost) / (h["qty"] + qty)
+                h["avg_price"] = (h["avg_price"] * h["qty"] + fill * qty) / (h["qty"] + qty)
                 h["qty"] += qty
             else:
                 if qty > h["qty"]:
                     return OrderResult(False, message="매도가능수량 부족")
                 h["qty"] -= qty
-                st["cash"] += fill * qty
+                st["cash"] += markets.to_krw(fill * qty, symbol, self.overseas_cfg)
         st["orders"][no] = {"qty": qty, "filled": qty if fill is not None else 0, "price": fill}
         self._save(st)
         return OrderResult(True, no, "주문 접수")

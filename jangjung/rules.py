@@ -7,7 +7,7 @@ import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from . import timeutil
+from . import markets, timeutil
 from .broker.base import Account, Quote
 from .orders import OrderGateway, OrderIntent
 from .pending import PendingStore
@@ -33,10 +33,10 @@ def untradable(q: Quote) -> bool:
     return bool(q.halted) or q.status_code == "58" or not q.price
 
 
-def cond_text(condition: str, threshold: float) -> str:
+def cond_text(condition: str, threshold: float, symbol: str = "") -> str:
     what, op = CONDITIONS[condition]
     if what == "현재가":
-        return f"현재가 {op} {threshold:,.0f}원"
+        return f"현재가 {op} {markets.fmt_price(symbol, threshold)}"
     return f"수익률 {op} {threshold:+g}%"
 
 
@@ -52,7 +52,7 @@ def qty_text(side: str, mode: str, value: float) -> str:
 def rule_line(r: dict) -> str:
     st = {"active": "감시 중", "paused": "일시정지", "waiting_confirm": "확인 대기", "done": "완료",
           "cancelled": "취소"}.get(r["status"], r["status"])
-    return (f"#{r['id']} {r['name']}({r['symbol']}) · {cond_text(r['condition'], r['threshold'])} → "
+    return (f"#{r['id']} {r['name']}({r['symbol']}) · {cond_text(r['condition'], r['threshold'], r['symbol'])} → "
             f"{qty_text(r['side'], r['qty_mode'], r['qty_value'])} · {r['triggered']}/{r['max_triggers']}회 · {st}")
 
 
@@ -90,7 +90,9 @@ class RuleService:
         for i, d in enumerate(drafts, 1):
             tag = f"규칙{i}"
             sym = str(d.get("symbol", "")).strip()
-            if sym not in self.universe.master:
+            if markets.is_overseas(sym):
+                sym = sym.upper()
+            if not self.universe.exists(sym):
                 errors.append(f"{tag}: 종목코드 '{sym}'를 찾을 수 없음 — search_stock으로 확인 필요")
                 continue
             if why := self.universe.blocked_reason(sym):
@@ -128,22 +130,25 @@ class RuleService:
                 continue
             if side == "sell" and avail == 0:
                 warnings.append(f"{tag}: 현재 {name} 매도 가능 수량 0주 — 보유 후에만 실행됨")
+            fp = markets.fmt_price
             if cond.startswith("price") and abs(th / q.price - 1) > 0.3:
-                warnings.append(f"{tag}: 조건가 {th:,.0f}원이 현재가 {q.price:,.0f}원과 30% 이상 차이 — 오타가 아닌지 확인")
+                warnings.append(f"{tag}: 조건가 {fp(sym, th)}이 현재가 {fp(sym, q.price)}와 30% 이상 차이 — "
+                                "오타가 아닌지 확인" + (" (해외 종목 가격은 현지 통화)" if markets.is_overseas(sym) else ""))
             if cond == "return_at_or_below" and th > 0:
                 warnings.append(f"{tag}: '수익률 ≤ +{th}%'는 이미 충족될 수 있음 — 손절이면 음수여야 함")
             # 예상 주문 금액
             px = th if cond.startswith("price") else q.price
+            fx = self.fx(sym)                                  # 금액(원) ↔ 현지 통화
             if mode == "amount":
-                est_qty = math.floor(qv / px)
+                est_qty = math.floor(qv / (px * fx))
             elif mode == "shares":
                 est_qty = int(qv)
             else:
                 est_qty = math.floor(avail * qv)
-            est_amt = est_qty * px
+            est_amt = est_qty * px * fx
             limit_issues = self.gw.limit_issues(side, est_amt)
             if side == "buy" and est_qty == 0:
-                errors.append(f"{tag}: {qv:,.0f}원으로는 1주도 살 수 없음 (주가 약 {px:,.0f}원)")
+                errors.append(f"{tag}: {qv:,.0f}원으로는 1주도 살 수 없음 (주가 약 {fp(sym, px)})")
                 continue
             out.append({
                 "symbol": sym, "name": name, "side": side, "condition": cond, "threshold": float(th),
@@ -160,11 +165,14 @@ class RuleService:
         over = [r for r in rules if r["limit_issues"]]
         lines = [f"[규칙 등록 확인]", f"원문: \"{source_text}\""]
         for i, r in enumerate(rules, 1):
-            cur = f"현재가 {r['cur_price']:,.0f}원"
+            fp = markets.fmt_price
+            cur = f"현재가 {fp(r['symbol'], r['cur_price'])}"
             if r["avg_price"]:
                 ret = (r["cur_price"] / r["avg_price"] - 1) * 100
-                cur += f" · 평단 {r['avg_price']:,.0f}원 · 수익률 {ret:+.1f}%"
-            lines.append(f"{i}) {r['name']} · {cond_text(r['condition'], r['threshold'])} → "
+                cur += f" · 평단 {fp(r['symbol'], r['avg_price'])} · 수익률 {ret:+.1f}%"
+            if markets.is_overseas(r["symbol"]):
+                cur += f" · 해외({markets.COUNTRIES[markets.country_of(r['symbol'])]}) · 예상 {r['est_amount']:,.0f}원"
+            lines.append(f"{i}) {r['name']} · {cond_text(r['condition'], r['threshold'], r['symbol'])} → "
                          f"{qty_text(r['side'], r['qty_mode'], r['qty_value'])} (예상 {r['est_qty']}주) · 최대 {r['max_triggers']}회\n   {cur}")
         if len(rules) > 1:
             lines.append("※ 한 지시에서 나온 규칙은 한 묶음 — 전량 매도가 실행되면 나머지 매도 규칙은 자동 종료")
@@ -237,17 +245,21 @@ class RuleService:
             if r["side"] == "sell":
                 qty = min(qty, avail)
         elif r["qty_mode"] == "amount":
-            qty = math.floor(r["qty_value"] / q.price)
+            qty = math.floor(r["qty_value"] / (q.price * self.fx(r["symbol"])))
         else:
             qty = math.floor(avail * r["qty_value"])
         if qty <= 0:
             return Evaluation(False, metric, 0, "주문 가능 수량 0주")
         return Evaluation(True, metric, qty)
 
+    def fx(self, symbol: str) -> float:
+        return markets.fx_rate(markets.currency_of(symbol), self.settings.overseas)
+
     async def fire(self, r: dict, ev: Evaluation, q: Quote, detected_at: str, confirmed: bool = False,
                    anomaly_override: str | None = None) -> str:
-        metric_txt = f"현재 {ev.metric:,.0f}원" if r["condition"].startswith("price") else f"현재 {ev.metric:+.1f}%"
-        reason = f"규칙 #{r['id']} '{cond_text(r['condition'], r['threshold'])}' 충족 ({metric_txt}) → " \
+        metric_txt = (f"현재 {markets.fmt_price(r['symbol'], ev.metric)}" if r["condition"].startswith("price")
+                      else f"현재 {ev.metric:+.1f}%")
+        reason = f"규칙 #{r['id']} '{cond_text(r['condition'], r['threshold'], r['symbol'])}' 충족 ({metric_txt}) → " \
                  f"{qty_text(r['side'], r['qty_mode'], r['qty_value'])}"
         it = OrderIntent("rule", str(r["id"]), "rule", r["symbol"], r["side"], ev.qty, q.price, reason,
                          {"rule": {k: r[k] for k in ("condition", "threshold", "qty_mode", "qty_value")},
@@ -265,7 +277,7 @@ class RuleService:
             await self.pending.create(
                 "order_over_limit", {"rule_id": r["id"]},
                 f"[한도 초과 주문 확인]\n{r['name']} {'매수' if r['side'] == 'buy' else '매도'} {ev.qty}주 "
-                f"(약 {ev.qty * q.price:,.0f}원)\n근거: {reason}\n" + "\n".join(f"⛔ {i}" for i in out.issues) +
+                f"(약 {ev.qty * q.price * self.fx(r['symbol']):,.0f}원)\n근거: {reason}\n" + "\n".join(f"⛔ {i}" for i in out.issues) +
                 f"\n{ttl}분 안에 누르지 않으면 실행하지 않고 규칙을 일시정지합니다.",
                 [("주문 실행", "approve"), ("실행 안 함", "cancel")], ttl_min=ttl)
             return "needs_confirm"
@@ -340,14 +352,16 @@ class RuleService:
         if not ev.met:
             return None
         ttl = int(self.settings.engine.get("stop_loss_card_ttl_min", 30))
-        metric_txt = f"현재 {ev.metric:,.0f}원" if r["condition"].startswith("price") else f"현재 {ev.metric:+.1f}%"
-        issues = self.gw.limit_issues("sell", ev.qty * q.price)
+        fp = markets.fmt_price
+        metric_txt = f"현재 {fp(r['symbol'], ev.metric)}" if r["condition"].startswith("price") else f"현재 {ev.metric:+.1f}%"
+        issues = self.gw.limit_issues("sell", ev.qty * q.price * self.fx(r["symbol"]))
         self._set_status(r["id"], "waiting_confirm", "시세 이상 — 손절 매도 확인 대기")
         await self.pending.create(
             "stoploss_anomaly", {"rule_id": r["id"], "why": why},
             f"[시세 이상 중 손절 조건 충족 — 그래도 팔까요?]\n"
-            f"{r['name']} · 규칙 #{r['id']} '{cond_text(r['condition'], r['threshold'])}' 충족 ({metric_txt})\n"
-            f"매도 {ev.qty}주 · 약 {ev.qty * q.price:,.0f}원 (현재가 {q.price:,.0f}원, 전일 대비 {q.change_pct:+.1f}%)\n"
+            f"{r['name']} · 규칙 #{r['id']} '{cond_text(r['condition'], r['threshold'], r['symbol'])}' 충족 ({metric_txt})\n"
+            f"매도 {ev.qty}주 · 약 {ev.qty * q.price * self.fx(r['symbol']):,.0f}원 (현재가 {fp(r['symbol'], q.price)}, "
+            f"전일 대비 {q.change_pct:+.1f}%)\n"
             f"자동 매매를 멈춘 이유: {why}\n"
             "⚠ 시장가 주문이라 급변 중에는 체결가가 지금 가격과 크게 다를 수 있습니다.\n"
             + "".join(f"⛔ {i}\n" for i in issues) +

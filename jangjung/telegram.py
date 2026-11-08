@@ -63,7 +63,8 @@ class TelegramNotifier:
 BOT_COMMANDS = [
     ("status", "전체 상태"), ("rules", "감시 중인 규칙"), ("portfolio", "자동 투자 현황"),
     ("journal", "최근 주문 5건"), ("report", "PDF 보고서 받기: /report weekly"),
-    ("alerts", "알림 설정 보기·바꾸기: /alerts 체결 off"), ("summary", "지금 장 마감 요약"),
+    ("alerts", "알림 설정 보기·바꾸기: /alerts 체결 off"), ("strategy", "AI 투자 점검: /strategy run"),
+    ("fx", "환율: /fx update"), ("summary", "지금 장 마감 요약"),
     ("mode", "리밸런싱 방식: /mode auto|confirm"), ("stop", "모든 매매 즉시 중지"), ("resume", "중지 해제"),
     ("new", "대화 초기화"), ("help", "사용법"),
 ]

@@ -6,6 +6,9 @@
 - 모든 POST 에 실행마다 새로 만든 토큰(X-JJ-Token) 요구 → 다른 웹사이트가 몰래 요청 못 함 (CSRF 방지)
 - --lan (휴대폰 접속) 모드: 같은 Wi-Fi 에 열리므로 모든 요청에 PIN 로그인 세션 필요,
   Host 는 IP 주소/localhost 만 허용, PIN 5회 틀리면 5분 잠금
+- --public (Cloudflare Tunnel + Access) 모드: 서버는 그대로 127.0.0.1 에만 열고 cloudflared 가 연결한다.
+  Cloudflare 를 거쳐 온 요청(공개 주소 Host, 또는 Cf-Ray 헤더)은 Access 로그인 토큰(JWT)을 직접 검증하고,
+  Access 를 설정하지 않았으면 PIN 로그인을 요구한다. 이 PC에서 직접 연 요청은 지금처럼 바로 열린다.
 """
 from __future__ import annotations
 
@@ -25,7 +28,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from . import timeutil
+from . import markets, timeutil
 from .broker.base import BrokerError
 from .pdfreport import (PERIODS, MailError, build_report, deliver_reports, mail_config, mail_ready, mask_email,
                         send_mail, telegram_target)
@@ -37,25 +40,77 @@ log = logging.getLogger("jangjung")
 STATIC = Path(__file__).parent / "web_static"
 
 
+class AccessVerifier:
+    """Cloudflare Access JWT(Cf-Access-Jwt-Assertion 헤더 또는 CF_Authorization 쿠키) 검증.
+    https://<team>.cloudflareaccess.com/cdn-cgi/access/certs 의 공개키(RS256)로 서명·aud·iss·exp 를 확인한다."""
+
+    def __init__(self, team: str, aud: str, allowed_emails: list[str] | None = None):
+        team = team.strip().lower().removeprefix("https://").split(".cloudflareaccess.com")[0].strip("/")
+        self.issuer = f"https://{team}.cloudflareaccess.com"
+        self.aud = aud.strip()
+        self.allowed = {e.strip().lower() for e in (allowed_emails or []) if e.strip()}
+        self._jwks = None
+        self._ok: dict[str, tuple[float, str]] = {}      # 검증한 토큰 캐시 (만료 시각, 이메일)
+
+    def _key(self, token: str):
+        import jwt
+        if self._jwks is None:
+            self._jwks = jwt.PyJWKClient(f"{self.issuer}/cdn-cgi/access/certs", cache_keys=True, lifespan=3600)
+        return self._jwks.get_signing_key_from_jwt(token).key
+
+    def verify_sync(self, token: str) -> str:
+        """성공하면 이메일, 실패하면 ValueError."""
+        import jwt
+        hit = self._ok.get(token)
+        if hit and hit[0] > time.time():
+            return hit[1]
+        try:
+            claims = jwt.decode(token, self._key(token), algorithms=["RS256"], audience=self.aud, issuer=self.issuer,
+                                options={"require": ["exp", "aud", "iss"]})
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"Access 토큰 검증 실패: {type(e).__name__}") from e
+        email = str(claims.get("email", "")).lower()
+        if self.allowed and email not in self.allowed:
+            raise ValueError(f"허용되지 않은 계정: {email or '(이메일 없음)'}")
+        if len(self._ok) > 200:
+            self._ok.clear()
+        self._ok[token] = (float(claims["exp"]), email)
+        return email
+
+    async def verify(self, token: str) -> str:
+        if (hit := self._ok.get(token)) and hit[0] > time.time():
+            return hit[1]
+        return await asyncio.to_thread(self.verify_sync, token)
+
+
 class Dashboard:
-    def __init__(self, app, port: int = 8765, lan: bool = False, pin: str | None = None):
+    def __init__(self, app, port: int = 8765, lan: bool = False, pin: str | None = None,
+                 public_host: str | None = None, access: AccessVerifier | None = None):
         self.app = app
         self.port = port
         self.lan = lan
         self.pin = pin
+        self.public_host = (public_host or "").strip().lower() or None
+        self.access = access
         if lan and not (pin and pin.isdigit() and 6 <= len(pin) <= 12):
             raise ValueError("LAN 모드에는 6~12자리 숫자 PIN이 필요합니다")
+        if self.public_host and not access and not (pin and pin.isdigit() and 6 <= len(pin) <= 12):
+            raise ValueError("공개 주소(--public)에는 Cloudflare Access 설정(CF_ACCESS_TEAM·CF_ACCESS_AUD) "
+                             "또는 6~12자리 PIN이 필요합니다")
         self.token = secrets.token_urlsafe(24)
         self.sessions: set[str] = set()
         self._fails: list[float] = []
         self._cache: dict[str, tuple[float, object]] = {}
         self._lock = asyncio.Lock()
         self.allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if self.public_host:
+            self.allowed_hosts.add(self.public_host)
         self.store = app.store
 
     def _host_ok(self, host: str | None) -> bool:
         if not host:
             return False
+        host = host.lower()
         if host in self.allowed_hosts:
             return True
         if not self.lan:
@@ -69,10 +124,33 @@ class Dashboard:
         except ValueError:
             return False
 
+    @property
+    def pin_login(self) -> bool:
+        """PIN 로그인을 쓰는지: LAN 모드, 또는 공개 주소인데 Access 를 설정하지 않은 경우."""
+        return self.lan or (bool(self.public_host) and self.access is None)
+
+    def _remote(self, request: Request) -> bool:
+        """Cloudflare(Tunnel)를 거쳐 들어온 요청인지. 공개 주소 Host 이거나 Cloudflare 가 붙이는 헤더가 있으면 원격."""
+        h = request.headers
+        return bool(self.public_host) and ((h.get("host") or "").lower() == self.public_host
+                                           or "cf-ray" in h or "cf-connecting-ip" in h)
+
     def _authed(self, request: Request) -> bool:
-        if not self.lan:
+        if not self.lan and not self._remote(request):
             return True
         return request.cookies.get("jj_session") in self.sessions
+
+    async def _access_ok(self, request: Request) -> tuple[bool, str | None]:
+        """원격 요청의 Access 토큰 검증. (통과 여부, 실패 이유)"""
+        token = request.headers.get("cf-access-jwt-assertion") or request.cookies.get("CF_Authorization")
+        if not token:
+            return False, "Cloudflare Access 로그인이 필요합니다"
+        try:
+            await self.access.verify(token)
+            return True, None
+        except ValueError as e:
+            log.warning("Access 인증 거부: %s", e)
+            return False, str(e)
 
     # ── 공통 ──
     async def _cached(self, key: str, ttl: float, fn):
@@ -87,11 +165,17 @@ class Dashboard:
     def invalidate(self):
         self._cache.clear()
 
-    def _guard(self, request: Request, write: bool, public: bool = False) -> Response | None:
+    async def _guard(self, request: Request, write: bool, public: bool = False) -> Response | None:
         host = request.headers.get("host")
         if not self._host_ok(host):
             return JSONResponse({"error": "허용되지 않은 Host"}, 403)
-        if not public and not self._authed(request):
+        remote = self._remote(request)
+        if remote and self.access:
+            # 원격 요청은 로그인 화면·아이콘까지 포함해 모두 Access 토큰 필수
+            ok, why = await self._access_ok(request)
+            if not ok:
+                return JSONResponse({"error": why}, 403)
+        elif not public and not self._authed(request):
             if request.url.path == "/":
                 return RedirectResponse("/login", 303)
             return JSONResponse({"error": "로그인이 필요합니다"}, 401)
@@ -99,7 +183,8 @@ class Dashboard:
             if request.headers.get("x-jj-token") != self.token:
                 return JSONResponse({"error": "토큰 불일치 — 페이지를 새로고침하세요"}, 403)
             origin = request.headers.get("origin")
-            if origin and origin.split("//", 1)[-1] != host:
+            allowed = {(host or "").lower()} | ({self.public_host} if self.public_host else set())
+            if origin and origin.split("//", 1)[-1].lower() not in allowed:
                 return JSONResponse({"error": "다른 사이트에서 온 요청"}, 403)
         return None
 
@@ -108,7 +193,7 @@ class Dashboard:
             write = "POST" in methods and csrf
 
             async def handler(request: Request):
-                if bad := self._guard(request, write, public):
+                if bad := await self._guard(request, write, public):
                     return bad
                 try:
                     return await fn(request)
@@ -135,6 +220,10 @@ class Dashboard:
             r("/api/report/email", self.report_email, ("POST",)),
             r("/api/report/send", self.report_send, ("POST",)),
             r("/api/settings/backup", self.settings_backup),
+            r("/api/strategy", self.strategy),
+            r("/api/strategy/run", self.strategy_run, ("POST",)),
+            r("/api/strategy/reset", self.strategy_reset, ("POST",)),
+            r("/api/fx/update", self.fx_update, ("POST",)),
             r("/api/settings/restore", self.settings_restore, ("POST",)),
             r("/api/check/email", self.check_email, ("POST",)),
             r("/api/export/orders.csv", self.export_orders),
@@ -185,7 +274,7 @@ class Dashboard:
             "open_cards": len(a.pending.open_items()),
             "engine": {"started": a.engine.started, "last_step_at": a.engine.last_step_at},
             "restart_required": sorted(self.store.restart_required),
-            "lan": self.lan,
+            "lan": self.pin_login,
         })
 
     async def portfolio(self, request):
@@ -199,7 +288,8 @@ class Dashboard:
                 q = h.qty - auto_pos.get(h.symbol, {}).get("qty", 0)
                 if q > 0:
                     own.append({"symbol": h.symbol, "name": h.name, "qty": q, "avg_price": h.avg_price,
-                                "price": h.cur_price, "value": q * h.cur_price,
+                                "price": h.cur_price, "currency": h.currency,
+                                "value": markets.to_krw(q * h.cur_price, h.symbol, a.settings.overseas),
                                 "ret_pct": (h.cur_price / h.avg_price - 1) * 100 if h.avg_price else None})
             snaps = a.db.q("SELECT date, auto_value, auto_principal FROM daily_snapshots "
                            "WHERE auto_value IS NOT NULL ORDER BY date DESC LIMIT 90")[::-1]
@@ -237,11 +327,11 @@ class Dashboard:
 
     async def rules(self, request):
         rows = self.app.rules.list(include_inactive=True)
-        return JSONResponse({"rules": [dict(r, cond=cond_text(r["condition"], r["threshold"]),
+        return JSONResponse({"rules": [dict(r, cond=cond_text(r["condition"], r["threshold"], r["symbol"]),
                                             qty=qty_text(r["side"], r["qty_mode"], r["qty_value"])) for r in rows]})
 
     async def orders(self, request):
-        rows = self.app.db.q("SELECT id,created_at,detected_at,source,ref_id,name,symbol,side,qty,decision_price,"
+        rows = self.app.db.q("SELECT id,created_at,detected_at,source,ref_id,name,symbol,side,qty,decision_price,currency,"
                              "filled_qty,avg_fill_price,status,reason,error,broker_order_no FROM orders "
                              "ORDER BY id DESC LIMIT 200")
         return JSONResponse({"orders": rows})
@@ -260,6 +350,10 @@ class Dashboard:
                          "running": a.telegram_running},
             "sheets": {"enabled": a.journal.sheets_enabled, "error": a.journal.sheets_error},
             "telegram_reports": telegram_target(a) is not None,
+            "overseas": {"summary": markets.scope_text(s.overseas),
+                         "allowed": [markets.COUNTRIES[c] for c in markets.COUNTRIES
+                                     if c in markets.allowed_countries(s.overseas)],
+                         "open_now": sorted(markets.MARKETS[m]["name"] for m in a.engine.open_overseas())},
             "email": {"ready": mail_ready(), "host": mail_config()["host"],
                       "to": [mask_email(t) for t in mail_config()["to"]], "last": a.db.kv_get("report_mail_last"),
                       "report": {k: v for k, v in s.report.items() if not k.startswith("_")}},
@@ -277,7 +371,7 @@ class Dashboard:
             "env": self.store.env_describe(),
             "env_editable": not s.extra.get("demo"),
             "restart_required": sorted(self.store.restart_required),
-            "lan": self.lan,
+            "lan": self.pin_login,
             "holidays_upcoming": upcoming,
             "data_dir": str(s.data_dir),
             "config_files": ["config/settings.json", "config/strategies.json", ".env"],
@@ -335,6 +429,39 @@ class Dashboard:
         await self.app.notifier.send(f"[보고서 발송] {res['message']} (웹에서 요청)",
                                      category=None if res["errors"] else "report")
         return JSONResponse({"ok": True, "message": res["message"]})
+
+    # ── AI 전략 · 환율 ──
+    async def strategy(self, request):
+        from . import macro
+        a = self.app
+        st = a.autoinvest.state()
+        names = {s: a.universe.name(s) for s in a.universe.candidates}
+        return JSONResponse({
+            "settings": {k: v for k, v in a.settings.ai_strategy.items() if not k.startswith("_")},
+            "latest": a.strategist.latest(), "history": a.strategist.history(8),
+            "base": a.universe.tier(st["tier"])["targets"] if st else None,
+            "current": st["targets"] if st else None, "names": names,
+            "fx": macro.fx_summary(a.db, a.settings.overseas), "fx_last": a.db.kv_get("fx_last"),
+            "fx_auto": a.settings.overseas.get("fx_auto", "on"),
+        })
+
+    async def strategy_run(self, request):
+        msg = await self.app.engine.ai_review("웹 요청")
+        self.invalidate()
+        return JSONResponse({"ok": True, "message": msg})
+
+    async def strategy_reset(self, request):
+        msg = await self.app.strategist.reset_targets()
+        await self.app.notifier.send(f"[AI 전략] {msg} (웹에서 요청)", category="strategy")
+        self.invalidate()
+        return JSONResponse({"ok": True, "message": msg})
+
+    async def fx_update(self, request):
+        msg = await self.app.engine.update_fx()
+        self.invalidate()
+        if msg.startswith("환율 갱신 실패"):
+            return JSONResponse({"error": msg}, 502)
+        return JSONResponse({"ok": True, "message": msg})
 
     # ── 설정 백업 / 복구 ──
     async def settings_backup(self, request):
@@ -579,12 +706,12 @@ class Dashboard:
 
     # ── 로그인 (LAN 모드) ──
     async def login_page(self, request):
-        if not self.lan or self._authed(request):
+        if not self.pin_login or self._authed(request):
             return RedirectResponse("/", 303)
         return HTMLResponse(LOGIN_HTML, headers={"Cache-Control": "no-store", "X-Frame-Options": "DENY"})
 
     async def login_post(self, request):
-        if not self.lan:
+        if not self.pin_login:
             return RedirectResponse("/", 303)
         now = time.monotonic()
         self._fails = [t for t in self._fails if now - t < 300]
@@ -600,7 +727,8 @@ class Dashboard:
         sid = secrets.token_urlsafe(32)
         self.sessions.add(sid)
         resp = RedirectResponse("/", 303)
-        resp.set_cookie("jj_session", sid, httponly=True, samesite="strict", max_age=12 * 3600)
+        resp.set_cookie("jj_session", sid, httponly=True, samesite="strict", max_age=12 * 3600,
+                        secure=self._remote(request))           # 공개 주소(HTTPS)에서는 Secure 쿠키
         return resp
 
     async def logout(self, request):
@@ -653,10 +781,11 @@ def lan_ip() -> str | None:
         return None
 
 
-async def serve(app, port: int = 8765, lan: bool = False, pin: str | None = None) -> None:
+async def serve(app, port: int = 8765, lan: bool = False, pin: str | None = None,
+                public_host: str | None = None, access: AccessVerifier | None = None) -> None:
     import uvicorn
-    dash = Dashboard(app, port, lan=lan, pin=pin)
-    host = "0.0.0.0" if lan else "127.0.0.1"
+    dash = Dashboard(app, port, lan=lan, pin=pin, public_host=public_host, access=access)
+    host = "0.0.0.0" if lan else "127.0.0.1"          # --public 도 127.0.0.1 (cloudflared 가 같은 PC에서 연결)
     config = uvicorn.Config(dash.asgi(), host=host, port=port, log_level="warning", lifespan="off")
     server = uvicorn.Server(config)
     print(f"\n  장중대리 대시보드 → http://127.0.0.1:{port}")
@@ -664,5 +793,12 @@ async def serve(app, port: int = 8765, lan: bool = False, pin: str | None = None
         ip = lan_ip()
         print(f"  휴대폰(같은 Wi-Fi) → http://{ip or '<이 PC의 IP>'}:{port}")
         print(f"  접속 PIN: {pin}   ※ 집 Wi-Fi처럼 믿을 수 있는 네트워크에서만 쓰세요 (HTTP 평문)")
+    if public_host:
+        print(f"  밖에서 (Cloudflare Tunnel) → https://{public_host}")
+        if access:
+            extra = f" · 허용 계정 {', '.join(sorted(access.allowed))}" if access.allowed else ""
+            print(f"  로그인: Cloudflare Access ({access.issuer}){extra}")
+        else:
+            print(f"  로그인: PIN {pin}  ※ Cloudflare Access 를 설정하면 이메일 로그인으로 더 안전합니다 (README 참고)")
     print()
     await server.serve()

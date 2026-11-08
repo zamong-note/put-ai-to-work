@@ -116,6 +116,10 @@ class DB:
         cols = {r["name"] for r in self.q("PRAGMA table_info(daily_snapshots)")}
         if "detail" not in cols:          # 보고서용 장 마감 보유·비중 스냅샷 (JSON)
             self.conn.execute("ALTER TABLE daily_snapshots ADD COLUMN detail TEXT")
+        ocols = {r["name"] for r in self.q("PRAGMA table_info(orders)")}
+        if "currency" not in ocols:       # 해외 주문: 통화와 주문 당시 원화 환산율
+            self.conn.execute("ALTER TABLE orders ADD COLUMN currency TEXT DEFAULT 'KRW'")
+            self.conn.execute("ALTER TABLE orders ADD COLUMN fx REAL DEFAULT 1")
 
     def q(self, sql: str, args: tuple | list = ()) -> list[dict]:
         return [dict(r) for r in self.conn.execute(sql, args).fetchall()]

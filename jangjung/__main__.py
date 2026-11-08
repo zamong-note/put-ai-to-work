@@ -15,9 +15,12 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
 
 from .config import load_settings
+
+log = logging.getLogger("jangjung")
 
 
 def _setup_logging(data_dir):
@@ -27,7 +30,36 @@ def _setup_logging(data_dir):
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
-async def run_bot(settings, web: bool = True, port: int = 8765, lan: bool = False) -> None:
+def keep_awake() -> None:
+    """Windows: 이 프로그램이 도는 동안 절전(잠자기)으로 들어가지 않게 한다 (화면은 꺼져도 됨).
+    프로그램을 끄면 원래 전원 설정으로 돌아간다."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+        print("절전 방지: 실행 중에는 PC가 잠자기로 들어가지 않습니다 (끄려면 --allow-sleep)")
+    except Exception as e:  # noqa: BLE001
+        log.warning("절전 방지 설정 실패: %s", e)
+
+
+def public_options(host_arg: str | None):
+    """--public: (공개 주소, Access 검증기). 공개 주소는 인자나 .env 의 DASHBOARD_PUBLIC_HOST."""
+    host = (host_arg or os.getenv("DASHBOARD_PUBLIC_HOST", "")).strip().lower()
+    if not host:
+        raise SystemExit("--public 에는 공개 주소가 필요합니다: .env 의 DASHBOARD_PUBLIC_HOST=jangjung.example.com "
+                         "또는 --public-host jangjung.example.com")
+    team, aud = os.getenv("CF_ACCESS_TEAM", "").strip(), os.getenv("CF_ACCESS_AUD", "").strip()
+    access = None
+    if team and aud:
+        from .web import AccessVerifier
+        access = AccessVerifier(team, aud, os.getenv("ACCESS_ALLOWED_EMAILS", "").split(","))
+    return host, access
+
+
+async def run_bot(settings, web: bool = True, port: int = 8765, lan: bool = False,
+                  public_host: str | None = None, access=None) -> None:
     """장중 엔진 + 웹 대시보드 + (토큰이 있으면) 텔레그램 봇을 한 프로세스에서."""
     from .app import App
     tasks = []
@@ -49,13 +81,12 @@ async def run_bot(settings, web: bool = True, port: int = 8765, lan: bool = Fals
     if web:
         from .web import serve
         pin = None
-        if lan:
-            import os
+        if lan or (public_host and not access):
             import secrets
             pin = os.getenv("DASHBOARD_PIN", "").strip()
             if not (pin.isdigit() and 6 <= len(pin) <= 12):
                 pin = f"{secrets.randbelow(10**6):06d}"   # 설정이 없으면 실행할 때마다 새 PIN
-        tasks.append(serve(app, port, lan=lan, pin=pin))
+        tasks.append(serve(app, port, lan=lan, pin=pin, public_host=public_host, access=access))
     elif not settings.telegram_token:
         print("웹도 텔레그램도 꺼져 있습니다. 'chat' 명령으로 콘솔 모드를 쓰세요.")
         return
@@ -140,9 +171,14 @@ def main() -> None:
     p.add_argument("--no-web", action="store_true")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--lan", action="store_true", help="같은 Wi-Fi의 휴대폰에서 접속 (PIN 로그인)")
+    p.add_argument("--public", action="store_true",
+                   help="Cloudflare Tunnel 공개 주소로 밖에서 접속 (Access 이메일 로그인 또는 PIN)")
+    p.add_argument("--public-host", help="공개 주소 (기본: .env 의 DASHBOARD_PUBLIC_HOST)")
+    p.add_argument("--allow-sleep", action="store_true", help="실행 중에도 PC 절전을 허용")
     p.add_argument("--halt", action="store_true")
     p.add_argument("--email", action="store_true", help="report: 만든 PDF를 메일로 보냄")
     p.add_argument("--demo", action="store_true", help="report: 데모 기록(data/demo)으로 만듦")
+    p.add_argument("--overseas", action="store_true", help="update-master: 해외 종목 마스터도 받음")
     a = p.parse_args()
     settings = load_settings()
     if a.cmd == "report" and a.demo:
@@ -152,8 +188,12 @@ def main() -> None:
 
     if a.cmd in ("run", "web"):
         from .app import RealTradingLocked
+        public_host, access = public_options(a.public_host) if (a.public or a.public_host) else (None, None)
+        if not a.allow_sleep:
+            keep_awake()
         try:
-            asyncio.run(run_bot(settings, web=not a.no_web, port=a.port, lan=a.lan))
+            asyncio.run(run_bot(settings, web=not a.no_web, port=a.port, lan=a.lan, public_host=public_host,
+                                access=access))
         except KeyboardInterrupt:
             pass
         except RealTradingLocked as e:
@@ -181,8 +221,10 @@ def main() -> None:
     elif a.cmd == "check-kis":
         asyncio.run(check_kis(settings))
     elif a.cmd == "update-master":
-        from .universe import update_master
-        print(f"종목 {update_master(settings.data_dir):,}개 저장")
+        from .universe import update_master, update_overseas_master
+        print(f"국내 종목 {update_master(settings.data_dir):,}개 저장")
+        if a.overseas:
+            print(f"해외 종목 {update_overseas_master(settings.data_dir):,}개 저장 (미국·일본·중국·홍콩·베트남)")
     elif a.cmd == "sim-price":
         path = settings.data_dir / "sim_overrides.json"
         ov = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}

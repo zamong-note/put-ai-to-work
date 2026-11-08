@@ -14,7 +14,7 @@ from pathlib import Path
 
 import httpx
 
-from .. import timeutil
+from .. import markets, timeutil
 from .base import Account, BrokerError, BrokerNetworkError, BrokerRejected, FillStatus, Holding, OrderResult, Quote
 
 MOCK_BASE = "https://openapivts.koreainvestment.com:29443"
@@ -59,6 +59,10 @@ class KISBroker:
         self._token: str | None = None
         self._token_exp: datetime | None = None
         self._ccld_tr = self.tr["ccld"][0]
+        # 해외: App 이 설정과 연결해 준다 (허용 국가의 거래소 목록, 통화 → 원 환율)
+        self.overseas_markets = lambda: []
+        self.fx = lambda ccy: 1.0
+        self._ov_cache: tuple[float, dict] = (0.0, {})
 
     # ── 인증 ──
     async def _get_token(self, force: bool = False) -> str:
@@ -113,6 +117,8 @@ class KISBroker:
 
     # ── 시세 ──
     async def get_quote(self, symbol: str) -> Quote:
+        if markets.is_overseas(symbol):
+            return await self._ov_quote(symbol)
         d, _ = await self._call("GET", "/uapi/domestic-stock/v1/quotations/inquire-price", self.tr["price"],
                                 params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol})
         o = d.get("output") or {}
@@ -151,10 +157,17 @@ class KISBroker:
                 break
         # D+2 예수금(가수도정산금액)을 주문 가능 현금의 근사로 사용
         cash = float(summary.get("prvs_rcdl_excc_amt") or summary.get("dnca_tot_amt") or 0)
-        return Account(cash, holdings, float(summary.get("tot_evlu_amt") or 0))
+        total = float(summary.get("tot_evlu_amt") or 0)
+        if self.overseas_markets():
+            for sym, h in (await self._ov_holdings()).items():
+                holdings[sym] = h
+                total += h.qty * h.cur_price * self.fx(h.currency)
+        return Account(cash, holdings, total)
 
     # ── 주문 ──
     async def place_order(self, symbol, side, qty, order_type, price) -> OrderResult:
+        if markets.is_overseas(symbol):
+            return await self._ov_order(symbol, side, qty, price)
         body = {"CANO": self.cano, "ACNT_PRDT_CD": self.prdt, "PDNO": symbol,
                 "ORD_DVSN": "01" if order_type == "market" else "00",
                 "ORD_QTY": str(int(qty)), "ORD_UNPR": "0" if order_type == "market" else str(int(price)),
@@ -174,6 +187,8 @@ class KISBroker:
         return OrderResult(True, str(o.get("ODNO") or o.get("odno") or ""), d.get("msg1", "").strip())
 
     async def get_fill(self, order_no: str, symbol: str) -> FillStatus:
+        if markets.is_overseas(symbol):
+            return await self._ov_fill(order_no, symbol)
         day = timeutil.now().strftime("%Y%m%d")
         params = {"CANO": self.cano, "ACNT_PRDT_CD": self.prdt, "INQR_STRT_DT": day, "INQR_END_DT": day,
                   "SLL_BUY_DVSN_CD": "00", "INQR_DVSN": "00", "PDNO": symbol, "CCLD_DVSN": "00",
@@ -193,6 +208,77 @@ class KISBroker:
                 filled = int(float(row.get("tot_ccld_qty") or 0))
                 avg = float(row.get("avg_prvs") or 0) or None
                 return FillStatus(order_no, filled, avg, int(float(row.get("rmn_qty") or 0)))
+        return FillStatus(order_no, 0, None, -1)
+
+    # ── 해외주식 ──
+    async def _ov_quote(self, symbol: str) -> Quote:
+        m, code = markets.split(symbol)
+        d, _ = await self._call("GET", "/uapi/overseas-price/v1/quotations/price", "HHDFS00000300",
+                                params={"AUTH": "", "EXCD": markets.MARKETS[m]["excd"], "SYMB": code})
+        o = d.get("output") or {}
+        price = float(o.get("last") or 0)
+        if price <= 0:
+            raise BrokerError(f"{symbol} 현재가 없음 (휴장·거래정지이거나 코드 확인 필요)")
+        prev = float(o.get("base") or 0) or price
+        return Quote(symbol, price, prev, float(o.get("rate") or 0), False, "00", timeutil.now(),
+                     markets.currency_of(symbol))
+
+    async def _ov_holdings(self) -> dict[str, Holding]:
+        ts, cached = self._ov_cache
+        if time.monotonic() - ts < 30:
+            return cached
+        tr = "TTTS3012R" if self.real else "VTTS3012R"
+        mk = self.overseas_markets()
+        # 실전은 NASD 하나로 미국 전체, 모의는 거래소별로 조회
+        queries = sorted({("NASD" if self.real and markets.MARKETS[m]["country"] == "US" else m,
+                           markets.MARKETS[m]["ccy"]) for m in mk})
+        out: dict[str, Holding] = {}
+        for ex, ccy in queries:
+            d, _ = await self._call("GET", "/uapi/overseas-stock/v1/trading/inquire-balance", tr, params={
+                "CANO": self.cano, "ACNT_PRDT_CD": self.prdt, "OVRS_EXCG_CD": ex, "TR_CRCY_CD": ccy,
+                "CTX_AREA_FK200": "", "CTX_AREA_NK200": ""})
+            for row in d.get("output1") or []:
+                qty = int(float(row.get("ovrs_cblc_qty") or 0))
+                if qty <= 0:
+                    continue
+                sym = f"{(row.get('ovrs_excg_cd') or ex).strip()}:{row['ovrs_pdno'].strip()}"
+                out[sym] = Holding(sym, row.get("ovrs_item_name", sym), qty, float(row.get("pchs_avg_pric") or 0),
+                                   float(row.get("now_pric2") or 0), ccy)
+        self._ov_cache = (time.monotonic(), out)
+        return out
+
+    async def _ov_order(self, symbol, side, qty, price) -> OrderResult:
+        if price is None:
+            raise BrokerRejected("해외 주문은 지정가만 가능 (가격 없음)")
+        m, code = markets.split(symbol)
+        tr = markets.ORDER_TR[m][0 if side == "buy" else 1]
+        if not self.real:
+            tr = "V" + tr[1:]                                  # 모의투자 TR
+        body = {"CANO": self.cano, "ACNT_PRDT_CD": self.prdt, "OVRS_EXCG_CD": m, "PDNO": code,
+                "ORD_QTY": str(int(qty)), "OVRS_ORD_UNPR": f"{price:.{max(markets.decimals(symbol), 0)}f}",
+                "CTAC_TLNO": "", "MGCO_APTM_ODNO": "", "ORD_SVR_DVSN_CD": "0", "ORD_DVSN": "00",
+                "SLL_TYPE": "00" if side == "sell" else ""}
+        d, _ = await self._call("POST", "/uapi/overseas-stock/v1/trading/order", tr, body=body)
+        self._ov_cache = (0.0, {})                             # 잔고 캐시 무효화
+        o = d.get("output") or {}
+        return OrderResult(True, str(o.get("ODNO") or o.get("odno") or ""), d.get("msg1", "").strip())
+
+    async def _ov_fill(self, order_no: str, symbol: str) -> FillStatus:
+        m, code = markets.split(symbol)
+        now = timeutil.now()
+        end = markets.local_date(m, now)
+        start = markets.local_date(m, now - timedelta(days=2))
+        tr = "TTTS3035R" if self.real else "VTTS3035R"
+        params = {"CANO": self.cano, "ACNT_PRDT_CD": self.prdt, "PDNO": code if self.real else "%",
+                  "ORD_STRT_DT": start, "ORD_END_DT": end, "SLL_BUY_DVSN": "00", "CCLD_NCCS_DVSN": "00",
+                  "OVRS_EXCG_CD": m if self.real else "", "SORT_SQN": "DS", "ORD_DT": "", "ORD_GNO_BRNO": "",
+                  "ODNO": "", "CTX_AREA_NK200": "", "CTX_AREA_FK200": ""}
+        d, _ = await self._call("GET", "/uapi/overseas-stock/v1/trading/inquire-ccnl", tr, params=params)
+        for row in d.get("output") or []:
+            if str(row.get("odno", "")).lstrip("0") == str(order_no).lstrip("0"):
+                filled = int(float(row.get("ft_ccld_qty") or 0))
+                avg = float(row.get("ft_ccld_unpr3") or 0) or None
+                return FillStatus(order_no, filled, avg, int(float(row.get("nccs_qty") or 0)))
         return FillStatus(order_no, 0, None, -1)
 
     async def close(self):

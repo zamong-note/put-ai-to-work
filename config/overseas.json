@@ -1,0 +1,31 @@
+{
+  "_comment": "해외 종목 기본 목록 (KIS 해외 종목 마스터를 내려받기 전에도 검색되도록). 코드는 '거래소:티커'. update-master --overseas 로 전체 목록을 받는다.",
+  "symbols": {
+    "NASD:AAPL": {"name": "애플", "name_en": "Apple Inc", "kind": "STOCK"},
+    "NASD:MSFT": {"name": "마이크로소프트", "name_en": "Microsoft Corp", "kind": "STOCK"},
+    "NASD:NVDA": {"name": "엔비디아", "name_en": "NVIDIA Corp", "kind": "STOCK"},
+    "NASD:AMZN": {"name": "아마존닷컴", "name_en": "Amazon.com Inc", "kind": "STOCK"},
+    "NASD:GOOGL": {"name": "알파벳 A", "name_en": "Alphabet Inc Class A", "kind": "STOCK"},
+    "NASD:META": {"name": "메타 플랫폼스", "name_en": "Meta Platforms Inc", "kind": "STOCK"},
+    "NASD:TSLA": {"name": "테슬라", "name_en": "Tesla Inc", "kind": "STOCK"},
+    "NASD:QQQ": {"name": "인베스코 QQQ", "name_en": "Invesco QQQ Trust", "kind": "ETF"},
+    "AMEX:SPY": {"name": "SPDR S&P500 ETF", "name_en": "SPDR S&P 500 ETF Trust", "kind": "ETF"},
+    "AMEX:VOO": {"name": "뱅가드 S&P500 ETF", "name_en": "Vanguard S&P 500 ETF", "kind": "ETF"},
+    "NYSE:JPM": {"name": "JP모건체이스", "name_en": "JPMorgan Chase & Co", "kind": "STOCK"},
+    "NYSE:KO": {"name": "코카콜라", "name_en": "Coca-Cola Co", "kind": "STOCK"},
+    "NASD:TQQQ": {"name": "프로셰어즈 울트라프로 QQQ", "name_en": "ProShares UltraPro QQQ", "kind": "ETF"},
+    "NASD:SQQQ": {"name": "프로셰어즈 울트라프로 숏 QQQ", "name_en": "ProShares UltraPro Short QQQ", "kind": "ETF"},
+    "TKSE:7203": {"name": "도요타자동차", "name_en": "Toyota Motor Corp", "kind": "STOCK"},
+    "TKSE:6758": {"name": "소니그룹", "name_en": "Sony Group Corp", "kind": "STOCK"},
+    "TKSE:9984": {"name": "소프트뱅크그룹", "name_en": "SoftBank Group Corp", "kind": "STOCK"},
+    "SHAA:600519": {"name": "구이저우마오타이", "name_en": "Kweichow Moutai", "kind": "STOCK"},
+    "SZAA:300750": {"name": "CATL", "name_en": "Contemporary Amperex Technology", "kind": "STOCK"},
+    "SZAA:000858": {"name": "우량예", "name_en": "Wuliangye Yibin", "kind": "STOCK"},
+    "SEHK:00700": {"name": "텐센트", "name_en": "Tencent Holdings", "kind": "STOCK"},
+    "SEHK:09988": {"name": "알리바바", "name_en": "Alibaba Group Holding", "kind": "STOCK"},
+    "SEHK:03690": {"name": "메이퇀", "name_en": "Meituan", "kind": "STOCK"},
+    "VNSE:VNM": {"name": "비나밀크", "name_en": "Vietnam Dairy Products", "kind": "STOCK"},
+    "VNSE:VCB": {"name": "베트남외상은행", "name_en": "Vietcombank", "kind": "STOCK"},
+    "VNSE:FPT": {"name": "FPT", "name_en": "FPT Corp", "kind": "STOCK"}
+  }
+}

@@ -338,6 +338,16 @@ input[type="date"] { padding: 6px 10px; border: 1px solid var(--border); border-
           <div class="table-wrap" id="ownTable"></div>
         </div>
       </div>
+      <div class="card mt" id="aiCard">
+        <div class="st-head"><h2>AI 투자 점검</h2><span class="chip" id="aiStatus">—</span></div>
+        <p class="sub" id="aiSub">환율·국가별 경제지표·시장 흐름을 보고 자동 투자 목표 비중을 정해진 범위 안에서 조정합니다</p>
+        <div id="aiBody"></div>
+        <div class="row-actions" style="margin-top:12px">
+          <button class="btn small" id="aiRun">지금 점검</button>
+          <button class="btn small ghost" id="aiReset">기본 비중으로 되돌리기</button>
+          <button class="btn small ghost" id="fxRun">환율 지금 갱신</button>
+        </div>
+      </div>
       <p class="muted" style="font-size:12px;margin-top:10px" id="asOf"></p>
     </section>
 
@@ -435,6 +445,8 @@ input[type="date"] { padding: 6px 10px; border: 1px solid var(--border); border-
         <div class="grid" style="gap:14px;align-content:start">
           <div class="card" id="form-safety"></div>
           <div class="card" id="form-notify"></div>
+          <div class="card" id="form-overseas"></div>
+          <div class="card" id="form-ai_strategy"></div>
         </div>
         <div class="grid" style="gap:14px;align-content:start">
           <div class="card" id="form-engine"></div>
@@ -505,6 +517,10 @@ function s(tag, attrs = {}) {
 /* 숫자 */
 const won = v => v == null ? "—" : Math.round(v).toLocaleString("ko-KR") + "원";
 const num = v => v == null ? "—" : Math.round(v).toLocaleString("ko-KR");
+/* 가격: 국내는 원 단위 숫자, 해외는 현지 통화 (USD 182.50) */
+const PX_DEC = { USD: 2, CNY: 2, HKD: 3, JPY: 0, VND: 0 };
+const px = (v, ccy) => v == null ? "—" : (!ccy || ccy === "KRW") ? num(v)
+  : v.toLocaleString("ko-KR", { minimumFractionDigits: PX_DEC[ccy] ?? 2, maximumFractionDigits: PX_DEC[ccy] ?? 2 }) + " " + ccy;
 const man = v => {
   if (v == null) return "—";
   if (Math.abs(v) >= 1e8) return (v / 1e8).toFixed(Math.abs(v) >= 1e9 ? 0 : 2).replace(/\.?0+$/, "") + "억";
@@ -822,7 +838,7 @@ function renderAutoTable(p) {
 }
 function renderOwn(p) {
   $("#ownTable").replaceChildren(table(["종목", "수량", "평단", "현재가", "평가액", "수익률"],
-    p.own.map(o => [o.name, num(o.qty), num(o.avg_price), num(o.price), num(o.value), { el: pctEl(o.ret_pct) }]), [1, 2, 3, 4, 5],
+    p.own.map(o => [o.name, num(o.qty), px(o.avg_price, o.currency), px(o.price, o.currency), num(o.value), { el: pctEl(o.ret_pct) }]), [1, 2, 3, 4, 5],
     { empty: "직접 보유한 종목이 없습니다." }));
 }
 
@@ -851,7 +867,7 @@ async function loadOrders() {
   $("#ordersTable").replaceChildren(table(["종목", "시각", "구분", "방향", "수량", "판단시세", "체결가", "괴리", "상태", "근거"],
     d.orders.map(o => { const gap = o.avg_fill_price ? (o.avg_fill_price / o.decision_price - 1) * 100 : null; const [lbl, cls] = OST[o.status] || [o.status, ""];
       return [o.name, o.created_at.slice(5, 16).replace("T", " "), SRC[o.source] || o.source, o.side === "buy" ? "매수" : "매도", num(o.qty),
-        num(o.decision_price), o.avg_fill_price ? num(o.avg_fill_price) : "—", gap == null ? "—" : (gap > 0 ? "+" : "") + gap.toFixed(2) + "%",
+        px(o.decision_price, o.currency), o.avg_fill_price ? px(o.avg_fill_price, o.currency) : "—", gap == null ? "—" : (gap > 0 ? "+" : "") + gap.toFixed(2) + "%",
         { el: h("span", { class: "chip " + cls }, lbl) },
         { el: h("span", {}, o.reason, o.error ? h("div", { class: "down" }, "오류: " + o.error) : null), cls: "reason" }]; }), [4, 5, 6, 7],
     { empty: "아직 주문이 없습니다." }));
@@ -951,6 +967,9 @@ function renderStatusCards(st) {
       [["상태", sh.enabled ? "매매일지·일일요약 탭에 기록" : "로컬 CSV에만 기록"], ["최근 오류", sh.error || "—"]],
       sh.enabled ? null : "시트를 서비스 계정 이메일에 편집자로 공유한 뒤 경로와 시트 ID를 입력",
       sh.enabled ? checkBtn("접근 확인", "/api/check/sheets") : null),
+    statusCard("해외 투자", st.overseas.allowed.length ? "ok" : "off", st.overseas.allowed.length ? "켜짐" : "꺼짐 (국내만)",
+      [["범위", st.overseas.summary], ["지금 열린 시장", st.overseas.open_now.join(", ") || "없음"]],
+      st.overseas.allowed.length ? "해외는 시장가가 없어 현재가 ± 여유의 지정가로 주문합니다. 미국장은 한국 시각 밤(23:30~06:00, 서머타임 22:30~05:00)이라 그 시간에 PC가 켜져 있어야 합니다." : null),
     statusCard("보고서 메일", st.email.ready ? (st.email.last && !st.email.last.ok ? "bad" : "ok") : "off",
       st.email.ready ? (st.email.last && !st.email.last.ok ? "최근 발송 실패" : "설정됨") : "미설정",
       [["메일 서버", st.email.host || "—"], ["받는 주소", st.email.to.join(", ") || "—"],
@@ -1168,6 +1187,8 @@ async function loadSettings(force = false) {
   renderSection("engine", "운영 일정", "장중 엔진이 이 시각에 맞춰 움직입니다", st.schema.engine);
   renderSection("autoinvest", "자동 투자", "분할 매수·리밸런싱 방식", st.schema.autoinvest);
   renderSection("report", "보고서", "일간·주간·월간 PDF(3~5장)를 골라 받습니다 · 세 가지 모두 켤 수 있음 · 메일 계정·텔레그램 봇은 위 연결 설정", st.schema.report);
+  renderSection("overseas", "해외 투자", "켜면 허용한 나라의 해외 주식·ETF로 규칙 매매를 합니다 (각 시장 현지 장중에만 감시·주문). 자동 투자는 국내 상장 ETF 그대로입니다", st.schema.overseas);
+  renderSection("ai_strategy", "AI 전략", "AI가 환율·경제지표·시장 흐름을 주기적으로 점검해 자동 투자 목표 비중을 조정합니다. 위험 단계 기본 비중 ± 조정 한도 안에서만, 주문은 안전 한도·중지·시세 이상 검사를 그대로 거칩니다", st.schema.ai_strategy);
   renderSection("notify", "알림", "끈 알림은 텔레그램으로 보내지 않고 '대화·알림' 탭에만 남깁니다. 확인 카드·안전 경고·실패 알림은 항상 보냅니다. 텔레그램에서 /alerts 로도 바꿀 수 있습니다", st.schema.notify);
   renderHolidays(st.schema.holidays);
   state.dirty.clear();
@@ -1178,6 +1199,55 @@ $$("[data-job]").forEach(b => b.addEventListener("click", async () => {
   b.disabled = true; try { const r = await post("/api/run/" + b.dataset.job); toast(r.result || "완료"); } catch (e) { toast(e.message); }
   b.disabled = false; refreshAll();
 }));
+/* ── AI 투자 점검 ── */
+const AI_ST = { proposed: ["확인 대기", "bad"], executed: ["실행함", "good"], approved: ["장 시작 후 실행", ""],
+  declined: ["건너뜀", ""], no_change: ["변경 없음", ""], analysis: ["점검만", ""], rejected: ["제안 거부(범위 밖)", "bad"], skipped: ["실행 안 함", ""] };
+const AI_MODE = { off: "꺼짐", propose: "제안 후 확인", auto: "자동 실행" };
+const AI_CAD = { daily: "매일", weekly: "매주 첫 거래일", monthly: "매월 첫 거래일" };
+async function loadStrategy() {
+  const d = await api("/api/strategy");
+  const s = d.latest, cfg = d.settings, body = $("#aiBody");
+  $("#aiSub").textContent = `${AI_MODE[cfg.mode] || cfg.mode} · ${AI_CAD[cfg.cadence] || cfg.cadence} ${cfg.run_time} · 종목별 기본 비중 ±${cfg.max_tilt_pp}%p · 한 번 변경 ≤ ${cfg.max_turnover_pct}%`;
+  const [lbl, cls] = s ? (AI_ST[s.status] || [s.status, ""]) : ["기록 없음", ""];
+  const chip = $("#aiStatus"); chip.textContent = lbl; chip.className = "chip " + cls;
+  body.replaceChildren();
+  const fxRows = Object.entries(d.fx).map(([c, v]) => [c, v.krw_per_unit.toLocaleString("ko-KR", { maximumFractionDigits: 4 }) + "원",
+    v.chg_1d_pct == null ? "—" : { el: pctEl(v.chg_1d_pct) }, v.chg_30d_pct == null ? "—" : { el: pctEl(v.chg_30d_pct) }]);
+  const fxNote = d.fx_last ? `환율 갱신 ${d.fx_last.at.slice(5, 16).replace("T", " ")} · ${d.fx_last.source}${d.fx_auto === "on" ? " · 매 거래일 08:50 자동" : " · 자동 갱신 꺼짐"}` : "환율 아직 갱신 안 함 — '환율 지금 갱신'";
+  const left = h("div", {});
+  if (s) {
+    const r = s.result || {};
+    left.append(h("p", { style: "margin:0 0 8px" }, `#${s.id} · ${s.created_at.slice(5, 16).replace("T", " ")} · 확신도 ${r.confidence || "-"}`),
+      h("p", { style: "margin:0 0 10px;line-height:1.6" }, r.summary || ""));
+    if (r.country_views?.length) left.append(table(["국가", "판단", "근거"], r.country_views.map(c => [{ el: h("span", { style: "white-space:nowrap" }, c.country) }, { el: h("span", { style: "white-space:nowrap" }, c.view) }, { el: h("span", {}, c.reason), cls: "reason" }]), []));
+    if (r.risks?.length) left.append(h("p", { class: "hint" }, "위험: " + r.risks.join(" · ")));
+    if (s.note) left.append(h("p", { class: "hint" }, "※ " + s.note));
+    if (s.targets && d.base) {
+      const syms = [...new Set([...Object.keys(d.base), ...Object.keys(s.targets), ...Object.keys(d.current || {})])];
+      left.append(h("h3", { style: "margin:12px 0 6px;font-size:14px" }, "목표 비중 (단계 기본 → 점검 결과)"),
+        table(["종목", "기본", "지금 목표", "점검 결과"], syms.map(x => [d.names[x] || x, (d.base[x] || 0) + "%", ((d.current || {})[x] || 0) + "%", (s.targets[x] || 0) + "%"]), [1, 2, 3]));
+    }
+  } else left.append(h("p", { class: "muted" }, "아직 점검 기록이 없습니다. '지금 점검'을 누르거나 설정한 주기를 기다리세요."));
+  const right = h("div", {}, h("h3", { style: "margin:0 0 6px;font-size:14px" }, "환율 (1단위 = 원)"),
+    table(["통화", "환율", "1일", "30일"], fxRows, [1, 2, 3]), h("p", { class: "hint" }, fxNote));
+  body.append(h("div", { class: "grid two" }, left, right));
+}
+$("#aiRun").addEventListener("click", async (ev) => {
+  const b = ev.currentTarget; b.disabled = true; b.textContent = "점검 중… (AI 분석 1~2분)";
+  try { await post("/api/strategy/run"); toast("✓ 점검 완료 — 대화·알림 탭에도 기록"); } catch (e) { toast("✕ " + e.message); }
+  b.disabled = false; b.textContent = "지금 점검"; loadStrategy();
+});
+$("#aiReset").addEventListener("click", async () => {
+  if (!confirm("AI가 바꾼 목표 비중을 위험 단계 기본값으로 되돌릴까요? (다음 리밸런싱 때 맞춰 조정)")) return;
+  try { const r = await post("/api/strategy/reset"); toast("✓ " + r.message); } catch (e) { toast("✕ " + e.message); }
+  loadStrategy();
+});
+$("#fxRun").addEventListener("click", async (ev) => {
+  const b = ev.currentTarget; b.disabled = true;
+  try { const r = await post("/api/fx/update"); toast("✓ " + r.message); } catch (e) { toast("✕ " + e.message); }
+  b.disabled = false; loadStrategy();
+});
+
 /* ── 설정 백업 · 복구 ── */
 $("#restoreFile").addEventListener("change", async (ev) => {
   const file = ev.target.files[0]; ev.target.value = "";
@@ -1207,7 +1277,7 @@ addEventListener("beforeunload", e => { if (state.dirty.size) { e.preventDefault
 /* ── 갱신 루프 ── */
 async function refreshTab(force = false) {
   try {
-    if (state.tab === "overview") await loadPortfolio();
+    if (state.tab === "overview") { await loadPortfolio(); await loadStrategy(); }
     else if (state.tab === "rules") await loadRules();
     else if (state.tab === "orders") await loadOrders();
     else if (state.tab === "reports") await loadReports();

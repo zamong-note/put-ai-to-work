@@ -32,7 +32,9 @@ HELP = """장중대리 사용법
 · 멈춰 — 모든 규칙과 자동 투자 즉시 중지
 /status 상태 · /rules 규칙 · /portfolio 자동투자 · /journal 최근 주문
 /report daily|weekly|monthly|all [날짜] — PDF 보고서를 텔레그램으로
-/alerts — 알림 설정 보기 · /alerts 체결 off — 끄기 (체결·자동투자·요약·설정·보고서)
+/alerts — 알림 설정 보기 · /alerts 체결 off — 끄기 (체결·자동투자·요약·설정·보고서·전략)
+/strategy — 최근 AI 투자 점검 · /strategy run 지금 점검 · /strategy reset 기본 비중으로
+/fx — 현재 환율 · /fx update 지금 갱신
 /mode auto|confirm 리밸런싱 방식 · /resume 중지 해제 · /summary 지금 요약 · /new 대화 초기화"""
 
 
@@ -47,7 +49,8 @@ class App:
     def __init__(self, settings: Settings, notifier=None, console: bool = True):
         self.settings = settings
         self.db = DB(settings.data_dir / "jangjung.db")
-        self.universe = Universe(settings.strategies, settings.data_dir, settings.safety["blocked_name_keywords"])
+        self.universe = Universe(settings.strategies, settings.data_dir, settings.safety["blocked_name_keywords"],
+                                 settings.overseas, settings.overseas_symbols)
         self.broker = self._make_broker()
         self.control = Control(self.db, settings.safety)
         self.journal = Journal(settings.data_dir, settings.google_sa_file, settings.google_sheet_id)
@@ -64,6 +67,8 @@ class App:
         self.pending.register("resume_all", self._on_resume_all)
         self.pending.register("symbol_resume", self._on_symbol_resume)
         self.engine = Engine(self)
+        from .strategist import Strategist
+        self.strategist = Strategist(self)
         self._agent = None
         self.telegram_running = False
 
@@ -75,11 +80,16 @@ class App:
             if real and os.getenv("KIS_REAL_TRADING", "").strip().lower() != "yes":
                 raise RealTradingLocked("BROKER=kis_real 은 실제 돈으로 주문합니다. 정말 실전으로 운영하려면 "
                                         ".env 에 KIS_REAL_TRADING=yes 를 함께 넣으세요.")
-            return KISBroker(s.kis_app_key, s.kis_app_secret, s.kis_account, s.kis_account_product, s.data_dir,
-                             real=real)
+            b = KISBroker(s.kis_app_key, s.kis_app_secret, s.kis_account, s.kis_account_product, s.data_dir,
+                          real=real)
+            from . import markets
+            b.overseas_markets = lambda: [m for m, i in markets.MARKETS.items()
+                                          if i["country"] in markets.allowed_countries(s.overseas)]
+            b.fx = lambda ccy: markets.fx_rate(ccy, s.overseas)
+            return b
         if s.broker not in ("sim", ""):
             raise RealTradingLocked(f"알 수 없는 BROKER 값: {s.broker} (sim | kis | kis_real)")
-        return SimBroker(self.db, self.universe.name, s.sim, s.data_dir)
+        return SimBroker(self.db, self.universe.name, s.sim, s.data_dir, s.overseas)
 
     @property
     def agent(self):
@@ -210,6 +220,31 @@ class App:
             except Exception as e:  # noqa: BLE001
                 return f"보고서를 보내지 못했습니다: {e}"
             return res["message"]
+        if cmd == "/strategy":
+            sub = arg.strip().lower()
+            if sub == "run":
+                return await self.engine.ai_review(f"{via} 요청")
+            if sub == "reset":
+                return await self.strategist.reset_targets()
+            s = self.strategist.latest()
+            if not s:
+                return "아직 AI 투자 점검 기록이 없습니다. /strategy run 으로 지금 점검할 수 있습니다."
+            res = s["result"] or {}
+            st = {"proposed": "확인 대기", "executed": "실행함", "approved": "장 시작 후 실행", "declined": "건너뜀",
+                  "no_change": "변경 없음", "analysis": "점검만", "rejected": "제안 거부(범위 밖)", "skipped": "실행 안 함"}
+            return (f"[AI 투자 점검 #{s['id']} · {s['created_at'][5:16].replace('T', ' ')}] {st.get(s['status'], s['status'])}\n"
+                    f"{res.get('summary', '')}" + (f"\n※ {s['note']}" if s.get("note") else "")
+                    + f"\n설정: {self.settings.ai_strategy.get('mode')} · {self.settings.ai_strategy.get('cadence')}")
+        if cmd == "/fx":
+            from . import macro
+            if arg.strip().lower() == "update":
+                return await self.engine.update_fx()
+            fx = macro.fx_summary(self.db, self.settings.overseas)
+            last = self.db.kv_get("fx_last") or {}
+            lines = [f"{c} {v['krw_per_unit']:,.4g}원" + (f" (1일 {v['chg_1d_pct']:+.2f}%)" if v["chg_1d_pct"] is not None else "")
+                     for c, v in fx.items()]
+            return "[환율] 1단위 = 원\n" + "\n".join(lines) + (f"\n갱신 {last.get('at', '')[5:16].replace('T', ' ')} · {last.get('source')}"
+                                                              if last else "\n아직 자동 갱신 기록 없음 (/fx update)")
         if cmd == "/stop":
             return await self.emergency_stop()
         if cmd == "/resume":

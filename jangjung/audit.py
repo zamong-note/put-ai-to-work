@@ -19,7 +19,7 @@ def audit(db, universe) -> dict:
         tag = f"주문#{o['id']} {o['name']} {o['side']} {o['qty']}주"
         if not o["reason"]:
             violations.append(f"{tag}: 근거 없음")
-        if universe.blocked_reason(o["symbol"]):
+        if universe.product_blocked(o["symbol"]):
             violations.append(f"{tag}: 금지 상품")
         if o["source"] == "rule":
             r = db.one("SELECT * FROM rules WHERE id=?", (int(o["ref_id"]),))
@@ -45,6 +45,16 @@ def audit(db, universe) -> dict:
                 violations.append(f"{tag}: 전략 후보 밖 종목")
             if "target_pct" not in ev:
                 violations.append(f"{tag}: 목표 비중 근거 없음")
+        elif o["source"] == "ai_strategy":
+            # AI 전략 주문: 후보 종목 · 승인/자동 실행된 전략의 목표 비중과 일치해야 함
+            s = db.one("SELECT * FROM strategies WHERE id=?", (int(o["ref_id"]),)) if str(o["ref_id"]).isdigit() else None
+            targets = json.loads(s["targets"]) if s and s["targets"] else None
+            if o["symbol"] not in universe.candidates:
+                violations.append(f"{tag}: 전략 후보 밖 종목")
+            if targets is None:
+                violations.append(f"{tag}: 연결된 AI 전략 없음")
+            elif abs(float(ev.get("target_pct", -1)) - float(targets.get(o["symbol"], 0))) > 0.05:
+                violations.append(f"{tag}: AI 전략 목표 비중과 다름")
         else:
             violations.append(f"{tag}: 알 수 없는 주문 출처 {o['source']}")
     return {"orders": len(orders), "violations": violations,

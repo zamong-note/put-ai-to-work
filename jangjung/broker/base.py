@@ -26,6 +26,7 @@ class Quote:
     halted: bool = False
     status_code: str = "00"
     ts: datetime | None = None
+    currency: str = "KRW"
 
 
 @dataclass
@@ -35,6 +36,7 @@ class Holding:
     qty: int
     avg_price: float
     cur_price: float
+    currency: str = "KRW"
 
 
 @dataclass

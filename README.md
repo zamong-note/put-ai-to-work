@@ -58,9 +58,47 @@ Claude Agent SDK · 한국투자증권 KIS Open API(모의투자) · 텔레그�
 | 4 | 적극 | 지수 ETF 50%, 우량 대형주 50% | -15% |
 | 5 | 공격 | 대형·성장주 70%, 섹터 ETF 30% | -20% |
 
-종목과 비중은 [config/strategies.json](config/strategies.json)에 고정돼 있습니다 (후보 17종목, KIS 공식 종목 마스터로 코드·이름을 대조함). **LLM은 종목을 고르지 않습니다.**
+단계별 기본 종목과 비중은 [config/strategies.json](config/strategies.json)에 있습니다 (후보 17종목, KIS 공식 종목 마스터로 코드·이름을 대조함). 아래 **AI 투자 점검**이 이 기본 비중을 정해진 범위 안에서만 조정합니다.
 
-### 3. 공통 업무
+#### AI 투자 점검 (환율·경제지표 → 전략 수립 → 실행)
+주기(기본: 매주 첫 거래일 10:30)마다 AI가 투자 현황을 점검하고 자동 투자의 목표 비중을 정합니다.
+
+| 단계 | 하는 일 |
+|---|---|
+| 1. 데이터 수집 | **환율**(매 거래일 08:50 자동 갱신, 1일·30일 변화), **국가별 경제지표**(한국·미국·일본·중국·홍콩·베트남의 GDP 성장률·물가·실업률·경상수지, World Bank), 미국 금리·VIX(FRED, 키가 있을 때), **시장 흐름**(후보 종목 5·20·60거래일 수익률), 자동 투자 현황·손익 |
+| 2. AI 판단 | Claude가 국가별 판단(긍정·중립·부정)과 근거, 위험, 목표 비중을 제출. 근거는 받은 숫자만 인용하고, 데이터가 부족하면 **바꾸지 않는 것**이 기본 |
+| 3. 코드 검증 | 후보 종목 안에서만 · 종목마다 **단계 기본 비중 ±10%p**(설정) 안에서만 · 합계 100% · 한 번에 사고파는 금액은 평가액의 **20%** 이하(넘으면 조정 폭을 줄임). 범위 밖이면 반영하지 않고 알림 |
+| 4. 실행 | **제안 후 확인**(기본): 카드의 [실행]을 누르면 목표 비중을 바꾸고 조정 주문 · **자동 실행**: 바로 실행 후 보고 · **끔** |
+
+- 주문은 기존 게이트웨이를 그대로 거칩니다 (전체 중지·시세 이상·안전 한도). 손실 한도로 멈춘 상태나 "멈춰" 중에는 실행하지 않습니다.
+- 사용자가 직접 등록한 규칙 매매 종목은 건드리지 않습니다.
+- 모든 점검·주문에 근거가 남습니다 (주문 근거 "AI 전략 #3 · KODEX 200 목표 45% · 국내 지수 20일 +3%"). 주문 감사는 AI 주문이 승인된 전략의 목표 비중과 맞는지도 확인합니다.
+- 대시보드 개요의 "AI 투자 점검" 카드, 텔레그램 `/strategy`, PDF 보고서에서 결과를 봅니다. "기본 비중으로 되돌리기"로 AI 조정을 언제든 없앨 수 있습니다.
+- 환율은 설정 탭에서 직접 입력하거나 자동 갱신(기본)을 켭니다. 하루에 15% 넘게 바뀐 값은 오류로 보고 반영하지 않고 알립니다.
+
+### 3. 해외 투자 (선택)
+설정 탭 > **해외 투자**에서 정합니다. 기본은 꺼짐(국내만)입니다.
+
+| 해외 투자 | 투자 국가 | 거래할 수 있는 나라 |
+|---|---|---|
+| 안 함 | — | 한국만 |
+| 함 | 주요 3개국 | 미국 · 일본 · 중국(상해·심천) |
+| 함 | 전체 | 미국 · 일본 · 중국 · 홍콩 · 베트남 (한국투자증권 Open API로 주문할 수 있는 5개국 전부) |
+| 함 | 직접 선택 | 위 5개국 중 고른 나라 |
+
+```
+나: 애플 200달러 아래로 내려오면 100만원어치 사 줘
+장중대리: [규칙 등록 확인] 애플 · 현재가 ≤ 200.00 USD → 1,000,000원어치 매수 (예상 3주) · 해외(미국)
+```
+- 해외 종목은 `거래소:티커`로 다룹니다 (예: `NASD:AAPL`, `TKSE:7203`, `SHAA:600519`, `SEHK:00700`, `VNSE:VNM`). 한글명·영문명·티커로 검색됩니다.
+- 가격 조건은 **현지 통화**, 금액은 **원화**입니다. 안전 한도(1회·하루 매수 금액)는 설정의 근사 환율로 원화 환산해 검사합니다.
+- **각 시장의 현지 장중에만** 감시·주문합니다. 예: 미국은 한국 시각 밤 23:30~06:00(서머타임 22:30~05:00). 그 시간에 PC가 켜져 있어야 합니다.
+- 해외는 시장가 주문이 없어 **현재가 ± 여유(기본 1%)의 지정가**로 주문합니다.
+- 허용하지 않은 나라의 종목은 검색은 되지만 등록·주문은 막히고, 이유("허용하지 않은 국가: 홍콩")를 알려 줍니다. 등록한 뒤 해외 투자를 끄면 그 규칙은 주문하지 않습니다.
+- 해외 레버리지·인버스(예: TQQQ, SQQQ)도 이름의 Ultra·Inverse·Bear·3X 같은 키워드로 차단합니다.
+- 자동 투자(위험 단계 1~5)는 해외 설정과 관계없이 **국내 상장 ETF**로 운용합니다. 해외 지수는 국내 상장 해외 ETF(TIGER 미국S&P500 등)로 이미 담고 있습니다.
+
+### 4. 공통 업무
 - 체결 알림: 근거, 판단 당시 시세, 체결가, 주문번호
 - 매매일지: 한 줄에서 `근거 · 판단 시세 · 체결가 · 괴리(%)`를 대조할 수 있게 기록 (CSV, 설정하면 Google Sheets에도)
 - 장 마감 요약 (15:40): `자동 투자 +0.8% · 규칙 매매 체결 1건 · 남은 규칙 3개`
@@ -77,7 +115,7 @@ Claude Agent SDK · 한국투자증권 KIS Open API(모의투자) · 텔레그�
 
   총 3~5장이며 5장을 넘으면 주문 표를 최근 건 위주로 줄이고, 전체 주문은 CSV로 함께 첨부합니다. 내용은 모두 DB 기록에서 만들고 LLM은 쓰지 않습니다.
 
-### 4. 로컬 대시보드 (http://127.0.0.1:8765)
+### 5. 로컬 대시보드 (http://127.0.0.1:8765)
 장중엔 텔레그램 알림만 보고, 퇴근 후나 주말에는 PC 브라우저로 한눈에 봅니다. 외부 라이브러리·CDN 없이 오프라인으로 동작합니다.
 
 | 탭 | 보여 주는 것 |
@@ -100,7 +138,12 @@ Claude Agent SDK · 한국투자증권 KIS Open API(모의투자) · 텔레그�
 **휴대폰에서 보기** (`run --lan`)
 - 하단 탭바, 표 → 카드 전환, 2열 타일, 하단 고정 입력창, 큰 터치 영역으로 모바일 화면에 맞췄습니다. 홈 화면에 추가하면 앱처럼 열립니다.
 - `--lan`으로 실행하면 같은 Wi-Fi의 휴대폰에서 `http://<PC IP>:8765`로 접속합니다. 모든 요청에 **PIN 로그인**이 필요하고(5회 틀리면 5분 잠금), IP 주소로 들어온 요청만 받습니다.
-- HTTP 평문이므로 집 Wi-Fi처럼 믿을 수 있는 네트워크에서만 쓰세요. 밖에서는 텔레그램을 쓰는 것이 전제입니다.
+- HTTP 평문이므로 집 Wi-Fi처럼 믿을 수 있는 네트워크에서만 쓰세요. 밖(LTE)에서는 아래 `--public`을 쓰세요.
+
+**밖에서 접속하기** (`run --public`, Cloudflare Tunnel + Access, 무료)
+- 프로그램은 집 PC에서 그대로 돌고, Cloudflare Tunnel이 `https://jangjung.내도메인`을 PC의 `127.0.0.1:8765`에 연결합니다. 공유기 포트를 열지 않습니다.
+- Cloudflare Access가 앞에서 **본인 이메일 로그인**(메일로 온 일회용 코드)을 받고, 프로그램도 Access 로그인 토큰(JWT)의 서명·대상(AUD)·발급처·만료·이메일을 **직접 한 번 더 검증**합니다. Access 설정을 빠뜨려도 대시보드가 열려 버리지 않습니다.
+- Claude는 계속 이 PC의 Claude Code 로그인으로 동작하므로 **추가 API 비용이 없습니다.** 설정 방법은 아래 [밖에서 접속하기 설정](#밖에서-접속하기-설정-cloudflare-tunnel--access).
 
 ---
 
@@ -143,9 +186,14 @@ Claude Agent SDK · 한국투자증권 KIS Open API(모의투자) · 텔레그�
 | 알림 설정 (종류별 켜기/끄기, `/alerts`), 텔레그램 명령어 메뉴 등록 | ✅ | 테스트 |
 | 설정 백업(JSON 다운로드)·복구(업로드 → 미리보기 → 적용), 비밀값 제외, 잘못된 값이 있으면 전체 거부 | ✅ | 테스트 |
 | KIS 실전 계좌 모드 (이중 잠금, 실전 도메인·TR ID, 화면에서 전환 불가) | ✅ | 테스트 (설정·잠금만, 실제 주문은 안 함) |
+| 해외 투자 설정 (꺼짐 / 주요 3개국 / 전체 / 직접 선택), 국가별 허용·차단, 해외 레버리지 차단 | ✅ | 테스트 |
+| 해외 규칙 매매: 현지 장중에만 감시(서머타임·미국 휴장일 반영), 지정가 주문, 원화 환산 한도, 현지 통화 표기 | ✅ | 테스트 (시뮬레이터) |
+| 환율 자동 갱신 (매 거래일 08:50 · 지금 갱신 · 15% 급변 차단 · 대체 API) | ✅ | 테스트 + 실제 API 1회 |
+| AI 투자 점검: 환율·경제지표·시장 흐름 → Claude 판단 → 범위 검증 → 제안 카드/자동 실행, 기본 비중으로 되돌리기 | ✅ | 테스트 (가짜 AI) + 실제 Claude·World Bank 1회 |
+| 밖에서 접속 `--public`: Access JWT 직접 검증(서명·AUD·발급처·만료·허용 이메일), Cloudflare 경유 요청 구분, PIN 대체, HTTPS 전용 쿠키, 실행 중 절전 방지 | ✅ | 테스트 (가짜 키) + 로컬 실행 확인 |
 
 ```
-uv run pytest -q   →  38 passed
+uv run pytest -q   →  57 passed
 ```
 
 ### 🚧 아직 안 되는 것 / 검증 못 한 것
@@ -153,6 +201,12 @@ uv run pytest -q   →  38 passed
 | 항목 | 상태 |
 |---|---|
 | **KIS 실전 계좌** | 실전 도메인과 TR ID(TTTC0012U 매수 · TTTC0011U 매도 · TTTC8434R 잔고 · TTTC0081R 체결)를 공식 명세대로 넣었지만 **실제 계좌로는 한 번도 주문해 보지 않았습니다.** 모의투자로 충분히 운영한 뒤, 적은 금액·낮은 한도로 시작하세요. |
+| **KIS 해외주식 실연결** | 해외 시세(HHDFS00000300)·주문(미국 TTTT1002U/1006U 등)·잔고(TTTS3012R)·체결(TTTS3035R)을 공식 명세대로 넣었지만 실제 계좌로 확인하지 않았습니다. 해외 잔고는 연속 조회(100건 넘는 보유)를 하지 않습니다. |
+| 해외 휴장일 | 미국 2026년 휴장일만 넣었습니다 (`config/settings.json`의 `overseas_holidays`). 일본·중국·홍콩·베트남 휴장일은 비어 있어 그날 주문이 거부될 수 있습니다. |
+| 환율 | 공개 API(open.er-api.com, 실패 시 ECB)의 하루 1번 갱신 값입니다. 실시간 체결 환율이 아니라 안전 한도 환산·AI 점검용 근사값입니다. 베트남 동은 ECB에 없어 첫 번째 API가 실패하면 갱신되지 않습니다. |
+| AI 투자 점검의 한계 | 경제지표는 World Bank 연간 값이라 느립니다 (최근 1~2년). 시장 흐름·환율 변화율은 프로그램을 돌린 날부터 쌓이므로 처음 몇 주는 비어 있고, 그동안 AI는 대부분 "유지"로 판단합니다. 실제 Claude로 점검 1회를 돌려 실제 환율·경제지표를 근거로 인용하는 것까지 확인했지만, AI 판단의 수익성은 검증하지 않았습니다. 자동 실행 전에 "제안 후 확인"으로 충분히 지켜보세요. |
+| AI 점검 비용 | 점검 1회마다 Claude를 한 번 부릅니다 (매주 1회 기본). 매일로 바꾸면 그만큼 사용량이 늘어납니다. |
+| 해외 자동 투자·환전 | 자동 투자는 국내 상장 ETF로만 합니다. 해외 매수 대금은 증권사의 통합증거금(원화 자동 환전) 또는 미리 환전한 외화가 필요합니다. |
 | **KIS 모의투자 실연결** | 공식 명세대로 코드를 작성했지만(토큰, 현재가, 잔고, 현금주문, 체결조회) **실제 앱키로 아직 테스트하지 않았습니다.** TR ID·응답 필드가 다르면 수정이 필요합니다. 먼저 `check-kis`로 점검해야 합니다. |
 | **텔레그램 봇 실연결** | long polling·인라인 버튼 코드는 작성했지만 실제 봇 토큰으로 테스트하지 않았습니다. 지금은 콘솔 모드로만 확인했습니다. |
 | **Google Sheets** | gspread 연동 코드는 작성했지만 서비스 계정으로 테스트하지 않았습니다. 실패해도 CSV에는 항상 기록됩니다. |
@@ -168,7 +222,8 @@ uv run pytest -q   →  38 passed
 | 자동 투자 전략 편집 | 단계별 종목·비중(`config/strategies.json`)은 화면에서 바꿀 수 없습니다. LLM은 물론 화면에서도 즉흥적으로 바꾸지 않도록 파일 수정으로만 둡니다. |
 | 연결 설정 일부 즉시 적용 | 증권사(브로커·KIS 키·계좌)와 텔레그램 봇 토큰, PIN은 저장 후 프로그램을 다시 시작해야 적용됩니다. |
 | 실제 휴대폰 | 390px 폭 화면은 PC 브라우저에서 확인했고, 실제 iPhone/Android 기기에서는 아직 확인하지 않았습니다. |
-| HTTPS | `--lan`은 HTTP 평문입니다. 외부(LTE)에서 접속하는 기능은 없습니다. |
+| 밖에서 접속 | `--public`(Cloudflare Tunnel + Access)은 가짜 토큰·가짜 주소로 검증 경로를 시험했고, 실제 Cloudflare 계정·도메인으로는 아직 연결해 보지 않았습니다. 도메인이 Cloudflare에 연결돼 있어야 합니다. `--lan`은 HTTP 평문입니다. |
+| PC 상시 실행 | 집 PC가 꺼지거나 잠자기에 들어가면 감시·주문·보고서가 멈춥니다. `run`은 실행 중 절전을 막지만(노트북 덮개 닫힘은 전원 설정에서 따로), 정전·재부팅 뒤 자동 시작은 아래 '자동 시작'을 직접 설정해야 합니다. |
 | **보고서 메일 실발송** | 가짜 SMTP 서버로만 테스트했습니다. 실제 Gmail 계정(앱 비밀번호)으로는 아직 보내 보지 않았습니다. 설정 탭의 "테스트 메일"로 먼저 확인하세요. |
 | 보고서 발송 놓침 | PC가 꺼져 있던 날의 보고서는 나중에 자동으로 다시 보내지 않습니다. 보고서 탭, 텔레그램 `/report`, `report ... --email`로 직접 받아야 합니다. |
 | 백업 범위 | 설정 백업에는 규칙·자동 투자·매매 기록이 들어가지 않습니다 (규칙은 확인 카드를 거쳐야 하므로). 기록까지 옮기려면 `data/` 폴더를 통째로 복사하세요. |
@@ -177,7 +232,7 @@ uv run pytest -q   →  38 passed
 
 ---
 
-## 구조: LLM은 해석만, 주문은 코드가
+## 구조: LLM은 해석과 판단까지, 주문은 코드가
 
 ```
 텔레그램/웹/콘솔 ┬─ "멈춰", /명령 ─────────────► 코드가 즉시 처리
@@ -185,7 +240,8 @@ uv run pytest -q   →  38 passed
                                                      │ (주문 도구 없음)
 사용자 버튼 클릭 ─► PendingStore ─► 규칙 등록 · 자동투자 시작 · 한도 초과 승인
                                                      │
-장중 엔진 (20초 주기, LLM 없음) ─► 규칙 평가 / 분할매수 / 리밸런싱 / 손실 한도
+AI 투자 점검 (주기) ─► 환율·경제지표 수집 ─► Claude 판단 ─► 코드 검증(범위·합계·변경 한도) ─► 제안 카드/자동 실행
+장중 엔진 (20초 주기, LLM 없음) ─► 규칙 평가 / 분할매수 / 리밸런싱 / 손실 한도 / AI 전략 실행
                                                      ▼
                      OrderGateway (모든 주문이 지나는 단 하나의 길)
                      중지 확인 → 금지 상품 → 보유 수량 → 안전 한도 → 주문 → 체결 확인
@@ -193,7 +249,7 @@ uv run pytest -q   →  38 passed
                     KIS 모의투자(또는 시뮬레이터) · 매매일지(CSV/Sheets) · 체결 알림
 ```
 
-- **LLM에게 주문 도구를 주지 않습니다.** Claude는 정형 규칙 초안을 만들고 확인 카드를 띄우는 데까지만 합니다.
+- **LLM에게 주문 도구를 주지 않습니다.** 대화 Claude는 정형 규칙 초안과 확인 카드까지, 점검 Claude는 "목표 비중 제출"까지만 합니다. 제출한 비중은 코드가 검증하고, 주문은 엔진이 게이트웨이로 냅니다.
 - Claude Code 내장 도구(Bash, 파일, 웹)는 모두 끄고(`tools=[]`), 허용 목록 밖 도구는 거부합니다(`permission_mode="dontAsk"`).
 - 등록·변경·첫 구성·한도 초과·손실 한도 재개는 모두 **사용자의 버튼 클릭**으로만 확정됩니다. 버튼을 두 번 눌러도 한 번만 실행됩니다.
 
@@ -208,11 +264,14 @@ uv run pytest -q   →  38 passed
 | 설정 | 화면 설정 편집: 스키마·검증·저장 | [jangjung/settings_store.py](jangjung/settings_store.py) |
 | 문서 | 일일보고서 (HTML·CSV) | [jangjung/report.py](jangjung/report.py) |
 | 문서·외부 | PDF 보고서(reportlab, 맑은 고딕/나눔고딕 포함) · SMTP 메일 발송 | [jangjung/pdfreport.py](jangjung/pdfreport.py) |
+| 외부 데이터 | 환율(open.er-api.com · ECB frankfurter), 경제지표(World Bank), 미국 금리·VIX(FRED, 선택) | [jangjung/macro.py](jangjung/macro.py) |
+| AI 전략 | 점검 → Claude 판단(submit_strategy) → 검증 → 제안/실행 | [jangjung/strategist.py](jangjung/strategist.py) |
+| 해외 시장 | 국가·거래소·통화·거래 시간·주문 TR·호가 | [jangjung/markets.py](jangjung/markets.py) |
 | 데이터 | KIS 종목 마스터 (KOSPI·KOSDAQ 3,534종목) | [jangjung/universe.py](jangjung/universe.py) |
 | 데이터 | 단계별 전략·후보 종목 목록 | [config/strategies.json](config/strategies.json) |
 | 데이터 | 안전 한도, 장 시간, 휴장일 캘린더 | [config/settings.json](config/settings.json) |
 | 저장소 | 규칙, 확인 대기, 자동투자 장부, 주문, 일일 스냅샷 (SQLite) | [jangjung/db.py](jangjung/db.py) |
-| 에이전트 도구 (15개) | search_stock, get_quote, get_account, list_rules, propose_rules, propose_rule_change, get_risk_questions, score_risk_profile, propose_autoinvest, get_autoinvest_status, set_rebalance_mode, get_journal, get_safety_limits, emergency_stop, request_resume | [jangjung/agent.py](jangjung/agent.py) |
+| 에이전트 도구 (16개) | search_stock, get_quote, get_account, list_rules, propose_rules, propose_rule_change, get_risk_questions, score_risk_profile, propose_autoinvest, get_autoinvest_status, set_rebalance_mode, get_journal, get_safety_limits, get_ai_strategy, emergency_stop, request_resume | [jangjung/agent.py](jangjung/agent.py) |
 
 ---
 
@@ -224,7 +283,7 @@ uv sync
 
 # 2) 설정
 cp .env.example .env        # 키 입력. BROKER=sim 이면 키 없이 시뮬레이터로 동작
-uv run python -m jangjung update-master   # 종목 마스터 내려받기 (권장)
+uv run python -m jangjung update-master   # 종목 마스터 내려받기 (권장). --overseas 면 해외 종목도
 
 # 3) 키 없이 화면부터 보기: 일주일치 데모 기록 + 대시보드  →  http://127.0.0.1:8765
 uv run python -m jangjung demo        # data/demo 에 따로 저장 (실제 기록과 섞이지 않음)
@@ -245,7 +304,9 @@ uv run python -m jangjung check-kis
 uv run python -m jangjung run      # --port 9000 으로 포트 변경, --no-web 으로 대시보드 끄기
 uv run python -m jangjung run --lan   # 같은 Wi-Fi 휴대폰에서도 접속. 터미널에 주소와 PIN 표시
                                       # (.env 의 DASHBOARD_PIN 을 정하면 고정 PIN, 없으면 실행할 때마다 새 PIN)
-                                   # CHAT_ID를 비워 두면 첫 /start 때 콘솔에 chat_id 출력
+uv run python -m jangjung run --public   # 밖에서 https://jangjung.내도메인 으로 접속 (아래 설정 필요)
+                                         # 실행 중에는 PC 절전을 막음 (--allow-sleep 으로 끔)
+#    CHAT_ID를 비워 두면 첫 /start 때 콘솔에 chat_id 출력
 
 # 7) PDF 보고서: data/reports/ 에 저장, --email 이면 메일로도 보냄 (.env 의 SMTP_* 필요)
 uv run python -m jangjung report weekly                 # daily | weekly | monthly | all, 날짜 생략 시 오늘
@@ -256,7 +317,37 @@ uv run pytest -q
 uv run python -m jangjung audit    # 규칙·전략과 다른 주문 0건인지, 지연 60초 초과 건수
 ```
 
-Claude 인증은 `ANTHROPIC_API_KEY`를 쓰거나, 비워 두면 로컬 Claude Code 로그인 정보를 씁니다. 모델은 `CLAUDE_MODEL`(기본 `claude-opus-5-5`)로 바꿀 수 있습니다.
+Claude 인증은 `ANTHROPIC_API_KEY`를 쓰거나, 비워 두면 로컬 Claude Code 로그인 정보를 씁니다 (이 경우 API 요금이 따로 나가지 않음). 모델은 `CLAUDE_MODEL`(기본 `claude-opus-5-5`)로 바꿀 수 있습니다.
+
+### 밖에서 접속하기 설정 (Cloudflare Tunnel + Access)
+필요한 것: Cloudflare 계정(무료), **Cloudflare에 연결한 도메인**(Tunnel로 앱을 공개하려면 필수). 메뉴 이름은 2026년 11월 Cloudflare 문서 기준입니다.
+
+1. **로그인 방법 준비 (일회용 코드)**: Zero Trust → Integrations → Identity providers → Add new identity provider → **One-time PIN**.
+   팀 이름은 Zero Trust → Settings 에서 확인합니다 (`팀이름.cloudflareaccess.com`).
+2. **Access 앱 먼저 만들기**: Zero Trust → Access controls → Applications → Create new application → **Self-hosted and private** → Add public hostname 에 `jangjung` + 내 도메인.
+   Access policies 에서 **Allow** 정책을 만들고 규칙에 **본인 이메일**만 넣습니다 (Access는 기본이 전부 거부).
+   만든 뒤 Edit → Additional settings 에서 **Application Audience (AUD) Tag**를 복사합니다.
+3. **Tunnel 만들기**: Networking → Tunnels → Create Tunnel → 이름 `jangjung` → 환경 Windows.
+   cloudflared를 설치하고([64비트 MSI](https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.msi)), **관리자 명령 프롬프트**에서 화면에 나온 명령을 실행합니다:
+   ```
+   cloudflared.exe service install <화면에 나온 토큰>
+   ```
+   Windows 서비스로 등록되어 PC를 켜면 자동으로 연결됩니다. (Windows의 cloudflared는 자동 업데이트되지 않으니 가끔 MSI로 새로 설치하세요.)
+4. **공개 주소 연결**: 만든 터널 → Routes → Add route → **Published application** → Hostname `jangjung` + 내 도메인, Service URL `http://127.0.0.1:8765`.
+5. **이 프로그램 설정** (`.env` 또는 대시보드 설정 탭 → 연결 설정):
+   ```
+   DASHBOARD_PUBLIC_HOST=jangjung.내도메인
+   CF_ACCESS_TEAM=팀이름
+   CF_ACCESS_AUD=복사한 AUD 태그
+   ACCESS_ALLOWED_EMAILS=내이메일@example.com     # 선택: 프로그램에서도 한 번 더 제한
+   ```
+6. **실행**: `uv run python -m jangjung run --public`
+   휴대폰에서 `https://jangjung.내도메인` → 이메일 입력 → 메일로 온 코드 입력 → 대시보드. 홈 화면에 추가하면 앱처럼 열립니다.
+
+- Access를 아직 설정하지 않았다면 `CF_ACCESS_TEAM`·`CF_ACCESS_AUD`를 비워 두세요. 그러면 공개 주소에서는 **PIN 로그인**(`DASHBOARD_PIN`)을 대신 요구합니다. HTTPS라 `--lan`보다는 안전하지만, 이메일 로그인(Access)을 권합니다.
+- 이 PC에서 `http://127.0.0.1:8765`로 여는 것은 지금처럼 로그인 없이 됩니다. Cloudflare를 거쳐 온 요청은 주소를 바꿔 보내도(Cf-Ray 헤더로 구분) 로그인 없이는 열리지 않습니다.
+
+**자동 시작 (선택)**: 작업 스케줄러 → 기본 작업 만들기 → 트리거 "로그온할 때" → 동작 "프로그램 시작": 프로그램 `uv`, 인수 `run python -m jangjung run --public`, 시작 위치는 이 프로젝트 폴더. 노트북이면 전원 설정에서 "덮개를 닫을 때: 아무 것도 안 함"으로 두세요.
 
 ### 텔레그램 명령
 명령어 외의 문장은 Claude가 해석합니다 (예: "하이닉스 7% 떨어지면 전부 팔아 줘"). 봇을 켜면 입력창의 `/` 메뉴에 아래 명령이 나타납니다.
@@ -267,7 +358,9 @@ Claude 인증은 `ANTHROPIC_API_KEY`를 쓰거나, 비워 두면 로컬 Claude C
 | `/resume` | 중지 해제 (확인 카드) |
 | `/status` · `/rules` · `/portfolio` · `/journal` | 상태 · 감시 중 규칙 · 자동 투자 현황 · 최근 주문 5건 |
 | `/report daily\|weekly\|monthly\|all [날짜]` | PDF 보고서를 텔레그램으로 받기 |
-| `/alerts` · `/alerts 체결 off` | 알림 설정 보기 · 바꾸기 (체결·자동투자·요약·설정·보고서) |
+| `/alerts` · `/alerts 체결 off` | 알림 설정 보기 · 바꾸기 (체결·자동투자·요약·설정·보고서·전략) |
+| `/strategy` · `/strategy run` · `/strategy reset` | 최근 AI 투자 점검 · 지금 점검 · 기본 비중으로 되돌리기 |
+| `/fx` · `/fx update` | 현재 환율(1일 변화) · 지금 갱신 |
 | `/mode auto\|confirm` | 리밸런싱 자동 실행 / 매번 확인 |
 | `/summary` · `/new` · `/help` | 지금 장 마감 요약 · 대화 초기화 · 사용법 |
 
@@ -275,6 +368,6 @@ Claude 인증은 `ANTHROPIC_API_KEY`를 쓰거나, 비워 두면 로컬 Claude C
 
 ## 범위
 - 기본은 **모의투자** 계좌입니다. **실전 계좌**는 `.env`에 `BROKER=kis_real`과 `KIS_REAL_TRADING=yes`를 **둘 다** 넣어야 켜집니다. 하나만 있으면 실행을 멈추고, 웹 화면·설정 복구로는 실전으로 바꿀 수 없습니다. 실전에서는 등록한 규칙과 자동 투자가 **사용자 확인 없이** 실제 돈으로 체결됩니다 (규칙 등록·자동 투자 시작·안전 한도 초과 같은 확인 카드는 그대로).
-- 국내 상장 주식·ETF만 다룹니다. 해외 직접투자, 선물·옵션, 레버리지·인버스는 다루지 않습니다.
+- 기본은 국내 상장 주식·ETF입니다. **해외 직접투자는 설정에서 켠 경우에만**, 허용한 국가의 주식·ETF로 규칙 매매를 합니다 (아래 "해외 투자"). 선물·옵션, 레버리지·인버스는 국내·해외 모두 다루지 않습니다.
 - 초단타·고빈도 매매는 하지 않습니다 (20초 폴링, 하루 주문 20회 한도).
-- 자동 투자는 미리 정한 전략과 후보 목록 안에서만 움직입니다.
+- 자동 투자는 후보 목록 안에서, 위험 단계 기본 비중 ± AI 조정 한도 안에서만 움직입니다.

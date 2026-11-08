@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from . import timeutil
+from . import markets, timeutil
 from .broker.base import BrokerError
 from .rules import is_stop_loss, untradable
 
@@ -59,9 +59,21 @@ class Engine:
         await app.pending.expire_old()
         now = timeutil.now()
         in_session = timeutil.in_session(now, self.s.holidays, eng["session_start"], eng["session_end"])
+        overseas = self.open_overseas(now)
+        if in_session or overseas:
+            await self.tick(domestic=in_session, overseas=overseas)
+        # 환율 자동 갱신 (매 거래일 08:50)
+        if self.s.overseas.get("fx_auto", "on") == "on" and self._due("fx", "08:50"):
+            self._mark("fx")
+            await self.update_fx()
         if in_session:
-            await self.tick()
             if not app.control.halted():
+                await app.strategist.run_approved()           # 장외에 승인한 AI 전략
+                ai = self.s.ai_strategy
+                if (ai.get("mode", "off") != "off" and app.strategist.due(now)
+                        and self._due("ai_strategy", ai.get("run_time", "10:30"))):
+                    self._mark("ai_strategy")
+                    await self.ai_review("schedule")
                 if self._due("build", eng["build_time"]):
                     self._mark("build")
                     st = app.autoinvest.state()
@@ -79,6 +91,26 @@ class Engine:
                 and self._due("report_mail", self.s.report.get("send_time", "16:00"))):
             self._mark("report_mail")
             await self.report_mail()
+
+    async def update_fx(self) -> str:
+        from .macro import update_fx
+        try:
+            res = await update_fx(self.app)
+        except Exception as e:  # noqa: BLE001 — 환율 실패가 매매를 막지 않음 (이전 값 유지)
+            await self.alert_once("fx", f"[환율 갱신 실패] {e}\n이전 환율을 그대로 씁니다.")
+            return f"환율 갱신 실패: {e}"
+        if res["skipped"]:
+            await self.alert_once("fx_skip", "[환율 확인 필요] " + "; ".join(res["skipped"]))
+        return "환율 갱신: " + (", ".join(f"{l} {o}→{n}" for l, o, n in res["changes"]) or "변동 없음")
+
+    async def ai_review(self, trigger: str) -> str:
+        try:
+            res = await self.app.strategist.review(trigger)
+            return res["message"]
+        except Exception as e:  # noqa: BLE001 — AI 점검 실패가 매매를 막지 않음
+            log.exception("AI 점검 실패")
+            await self.app.notifier.send(f"[AI 투자 점검 실패] {type(e).__name__}: {e}\n목표 비중과 매매는 그대로입니다.")
+            return f"AI 점검 실패: {e}"
 
     async def report_mail(self, force_periods: list[str] | None = None) -> str | None:
         """그날 받을 보고서(일간·주간·월간 중 켠 것)를 설정한 곳(메일·텔레그램)으로 보낸다."""
@@ -124,24 +156,40 @@ class Engine:
         else:
             await self.alert_once(f"api:{label}", f"[API 오류] {label}: {e}\n이번 회차 주문은 건너뜁니다.")
 
-    async def tick(self) -> None:
+    def open_overseas(self, now=None) -> set[str]:
+        """허용한 국가 중 지금(현지 시각) 거래 중인 해외 거래소."""
+        allowed = markets.allowed_countries(self.s.overseas)
+        if not allowed:
+            return set()
+        now = now or timeutil.now()
+        return {m for m, i in markets.MARKETS.items()
+                if i["country"] in allowed and markets.market_open(m, now, self.s.overseas_holidays)}
+
+    async def tick(self, domestic: bool = True, overseas: set[str] | None = None) -> None:
         app = self.app
         if app.control.halted():
             return
+        if overseas is None:
+            overseas = self.open_overseas()
         try:
             await app.gateway.reconcile_open()
-            msg = await app.autoinvest.check_loss()
-            if msg:
-                log.warning(msg)
-            await self.evaluate_rules()
+            if domestic:
+                msg = await app.autoinvest.check_loss()
+                if msg:
+                    log.warning(msg)
+            await self.evaluate_rules(domestic, overseas)
             app.control.api_errors = 0
             app.control.last_api_ok = timeutil.now().isoformat()
         except BrokerError as e:
             await self._api_error("장중 감시", e)
 
-    async def evaluate_rules(self) -> None:
+    async def evaluate_rules(self, domestic: bool = True, overseas: set[str] | None = None) -> None:
         app = self.app
         rules = app.db.q("SELECT * FROM rules WHERE status='active' ORDER BY id")
+        # 각 시장이 열려 있을 때만 그 시장 규칙을 본다 (국내 장중 / 해외 현지 장중)
+        overseas = overseas or set()
+        rules = [r for r in rules if (domestic if not markets.is_overseas(r["symbol"])
+                                      else markets.market_of(r["symbol"]) in overseas)]
         if not rules:
             return
         acct = await app.broker.get_account()
@@ -161,8 +209,8 @@ class Engine:
                     if app.control.suspend(sym, why):
                         await app.pending.create(
                             "symbol_resume", {"symbol": sym},
-                            f"[시세 이상 — {r['name']} 매매 일시중단]\n{why}\n현재가 {q.price:,.0f}원 "
-                            f"(전일 {q.prev_close:,.0f}원)\n이 종목 규칙은 자동으로 주문하지 않습니다. "
+                            f"[시세 이상 — {r['name']} 매매 일시중단]\n{why}\n현재가 {markets.fmt_price(sym, q.price)} "
+                            f"(전일 {markets.fmt_price(sym, q.prev_close)})\n이 종목 규칙은 자동으로 주문하지 않습니다. "
                             "손절 조건이 충족되면 '그래도 팔까요?'를 따로 묻습니다.",
                             [("이 종목 매매 재개", "approve"), ("계속 중단", "cancel")], ttl_min=7 * 24 * 60)
             q = quotes[sym]
@@ -202,7 +250,8 @@ class Engine:
         if acct:
             auto_pos = app.gateway.ledger.positions()
             out["own"] = [{"symbol": h.symbol, "name": h.name, "qty": h.qty - auto_pos.get(h.symbol, {}).get("qty", 0),
-                           "avg": h.avg_price, "price": h.cur_price} for h in acct.holdings.values()
+                           "avg": h.avg_price, "price": h.cur_price, "currency": h.currency}
+                          for h in acct.holdings.values()
                           if h.qty - auto_pos.get(h.symbol, {}).get("qty", 0) > 0]
             out["account_total"] = acct.total_eval
         return json.dumps(out, ensure_ascii=False) if out else None
@@ -253,4 +302,17 @@ class Engine:
                                        fills, remaining, (h or {}).get("reason", "") if (h := app.control.halted()) else ""])
         text = "\n".join(lines)
         await app.notifier.send(text, category="summary")
+        await self._record_closes(val)
         return text
+
+    async def _record_closes(self, val: dict | None) -> None:
+        """AI 점검의 '시장 흐름'용: 자동 투자 후보 종목의 장 마감 가격 기록."""
+        from .macro import record_closes
+        prices = dict((val or {}).get("prices") or {})
+        for sym in self.app.universe.candidates:
+            if sym not in prices:
+                try:
+                    prices[sym] = (await self.app.broker.get_quote(sym)).price
+                except BrokerError:
+                    pass
+        record_closes(self.app.db, prices)

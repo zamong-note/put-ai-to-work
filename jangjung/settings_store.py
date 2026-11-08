@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import timeutil
 from .config import ROOT
+from .markets import COUNTRIES, SCOPES
 
 REQUIRED_KEYWORDS = ["레버리지", "인버스"]          # 범위 관리: 절대 해제 불가
 REQUIRED_STATUS = ["58"]                           # 거래정지는 항상 차단
@@ -78,6 +79,35 @@ SCHEMA: dict[str, list[dict]] = {
         dict(key="send_time", label="보내는 시각", type="time", min="15:30:00", max="23:59:00",
              help="장 마감 요약 뒤에 보냅니다 (그날 받을 보고서를 한 번에)"),
     ],
+    "overseas": [
+        dict(key="enabled", label="해외 투자", type="enum", options={"off": "안 함 (국내만)", "on": "함"},
+             help="켜면 허용한 국가의 해외 주식·ETF로도 규칙 매매를 합니다 (자동 투자는 국내 상장 ETF 그대로)"),
+        dict(key="scope", label="투자 국가", type="enum", options=dict(SCOPES)),
+        dict(key="countries", label="직접 선택 국가", type="codes", options=dict(COUNTRIES), required=[],
+             help="'직접 선택'일 때만 씁니다 · KIS로 주문할 수 있는 나라는 이 5개국입니다"),
+        dict(key="limit_slippage_pct", label="해외 주문 가격 여유", type="float", unit="%", min=0.1, max=5, step=0.1,
+             help="해외는 시장가가 없어 현재가 ±이만큼의 지정가로 주문합니다"),
+        dict(key="fx_auto", label="환율 자동 갱신", type="enum", options={"on": "매일 자동", "off": "직접 입력"},
+             help="매 거래일 08:50 공개 환율(open.er-api.com, 실패 시 ECB)로 아래 값을 갱신 · 하루 15% 넘게 바뀌면 반영하지 않고 알림"),
+        dict(key="fx_usd", label="환율 USD", type="float", unit="원", min=500, max=3000, step=0.01,
+             help="안전 한도·금액 원화 환산과 AI 점검에 씀 · 설정 탭에서 '지금 갱신' 가능"),
+        dict(key="fx_jpy100", label="환율 JPY (100엔)", type="float", unit="원", min=200, max=3000, step=0.01),
+        dict(key="fx_cny", label="환율 CNY", type="float", unit="원", min=50, max=500, step=0.01),
+        dict(key="fx_hkd", label="환율 HKD", type="float", unit="원", min=50, max=500, step=0.01),
+        dict(key="fx_vnd100", label="환율 VND (100동)", type="float", unit="원", min=1, max=20, step=0.001),
+    ],
+    "ai_strategy": [
+        dict(key="mode", label="AI 전략", type="enum",
+             options={"off": "끔", "propose": "제안 후 확인", "auto": "자동 실행"},
+             help="자동 실행: 점검 결과대로 목표 비중을 바꾸고 바로 주문한 뒤 보고합니다"),
+        dict(key="cadence", label="점검 주기", type="enum",
+             options={"daily": "매일", "weekly": "매주 (주 첫 거래일)", "monthly": "매월 (월 첫 거래일)"}),
+        dict(key="run_time", label="점검 시각", type="time", min="09:00:00", max="15:20:00", help="장중이어야 실행 가능"),
+        dict(key="max_tilt_pp", label="종목별 조정 한도", type="float", unit="%p", min=1, max=20, step=1,
+             help="위험 단계 기본 비중에서 이만큼까지만 늘리거나 줄입니다"),
+        dict(key="max_turnover_pct", label="한 번 변경 한도", type="float", unit="%", min=5, max=50, step=1,
+             help="한 번에 사고파는 금액이 평가액의 이 비율을 넘으면 조정 폭을 줄입니다"),
+    ],
     "notify": [
         dict(key="fill", label="체결 알림", type="enum", options={"on": "받음", "off": "안 받음"},
              help="주문 실패·거부 알림은 끌 수 없습니다"),
@@ -87,13 +117,15 @@ SCHEMA: dict[str, list[dict]] = {
         dict(key="settings", label="설정 변경 알림", type="enum", options={"on": "받음", "off": "안 받음"}),
         dict(key="report", label="보고서 발송 완료 알림", type="enum", options={"on": "받음", "off": "안 받음"},
              help="발송 실패 알림은 끌 수 없습니다"),
+        dict(key="strategy", label="AI 투자 점검 알림", type="enum", options={"on": "받음", "off": "안 받음"},
+             help="실행 확인 카드는 끌 수 없습니다"),
     ],
 }
 SECTION_LABEL = {"safety": "안전 한도", "engine": "운영 일정", "autoinvest": "자동 투자", "report": "보고서",
-                 "notify": "알림", "holidays": "휴장일"}
+                 "notify": "알림", "overseas": "해외 투자", "ai_strategy": "AI 전략", "holidays": "휴장일"}
 NOTIFY_ALIASES = {"체결": "fill", "자동투자": "auto", "자동": "auto", "요약": "summary", "마감": "summary",
-                  "설정": "settings", "보고서": "report"}
-BACKUP_SECTIONS = ("safety", "engine", "autoinvest", "report", "notify")
+                  "설정": "settings", "보고서": "report", "전략": "strategy", "AI": "strategy", "ai": "strategy"}
+BACKUP_SECTIONS = ("safety", "engine", "autoinvest", "report", "notify", "overseas", "ai_strategy")
 
 # .env: (키, 라벨, 종류, 적용 시점)
 ENV_SCHEMA = [
@@ -110,6 +142,14 @@ ENV_SCHEMA = [
          options=["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]),
     dict(key="ANTHROPIC_API_KEY", label="Anthropic API 키 (비우면 Claude Code 로그인)", kind="secret", live=True),
     dict(key="DASHBOARD_PIN", label="휴대폰 접속 PIN (6~12자리 숫자)", kind="secret", live=False, pattern=r"^\d{6,12}$"),
+    dict(key="DASHBOARD_PUBLIC_HOST", label="밖에서 접속할 주소 (Cloudflare Tunnel, 예: jangjung.example.com)",
+         kind="text", live=False, pattern=r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"),
+    dict(key="CF_ACCESS_TEAM", label="Cloudflare Access 팀 이름 (xxx.cloudflareaccess.com 의 xxx)", kind="text",
+         live=False, pattern=r"^[a-z0-9][a-z0-9-]{0,62}$"),
+    dict(key="CF_ACCESS_AUD", label="Cloudflare Access 앱 AUD 태그", kind="text", live=False,
+         pattern=r"^[A-Za-z0-9]{16,128}$"),
+    dict(key="ACCESS_ALLOWED_EMAILS", label="대시보드에 들어올 수 있는 이메일 (쉼표로 구분, 비우면 Access 정책만)",
+         kind="text", live=False, pattern=r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+(\s*,\s*[^@\s,]+@[^@\s,]+\.[^@\s,]+){0,4}$"),
     dict(key="SMTP_HOST", label="메일 서버 (예: smtp.gmail.com)", kind="text", live=True,
          pattern=r"^[A-Za-z0-9.\-]{3,100}$"),
     dict(key="SMTP_PORT", label="메일 포트 (587 STARTTLS / 465 SSL)", kind="text", live=True, pattern=r"^\d{2,5}$"),
@@ -121,7 +161,8 @@ ENV_SCHEMA = [
 ENV_PATH = ROOT / ".env"
 # 백업 파일에 넣는 연결 설정 (비밀값·계좌번호·브로커 종류 제외)
 ENV_BACKUP = ["KIS_ACCOUNT_PRODUCT", "TELEGRAM_CHAT_ID", "GOOGLE_SERVICE_ACCOUNT_FILE", "GOOGLE_SHEET_ID", "CLAUDE_MODEL",
-              "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "REPORT_EMAIL_TO"]
+              "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "REPORT_EMAIL_TO",
+              "DASHBOARD_PUBLIC_HOST", "CF_ACCESS_TEAM", "CF_ACCESS_AUD", "ACCESS_ALLOWED_EMAILS"]
 
 
 class SettingsError(ValueError):
@@ -263,6 +304,13 @@ class SettingsStore:
             summary = {**self.s.engine, **ctx.get("engine", {})}["summary_time"]
             if _tsec(merged["send_time"]) <= _tsec(summary):
                 raise SettingsError(f"보내는 시각은 장 마감 요약({summary})보다 뒤여야 합니다")
+        if (section == "overseas" and merged["enabled"] == "on" and merged["scope"] == "custom"
+                and not merged.get("countries")):
+            raise SettingsError("'직접 선택'이면 국가를 하나 이상 고르세요")
+        if section == "ai_strategy":
+            eng = {**self.s.engine, **ctx.get("engine", {})}
+            if not _tsec(eng["session_start"]) <= _tsec(merged["run_time"]) < _tsec(eng["session_end"]):
+                raise SettingsError("점검 시각은 감시 시간(장중) 안이어야 합니다")
         if section == "autoinvest" and merged["min_trade_dev_pp"] >= merged["rebalance_band_pp"]:
             raise SettingsError("조정 최소 차이는 리밸런싱 허용 범위보다 작아야 합니다")
         changes = []
@@ -464,7 +512,7 @@ def load_overrides(settings) -> None:
         ov = json.loads(p.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return
-    for sec in ("safety", "engine", "autoinvest", "report", "notify"):
+    for sec in ("safety", "engine", "autoinvest", "report", "notify", "overseas", "ai_strategy"):
         fields = {f["key"]: f for f in SCHEMA[sec]}
         for k, v in (ov.get(sec) or {}).items():
             if k in fields and k != "rebalance_mode":

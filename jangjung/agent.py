@@ -21,7 +21,7 @@ from .rules import rule_line
 log = logging.getLogger("jangjung")
 
 SYSTEM_PROMPT = """너는 '장중대리'다. 회의로 바쁜 직장인 투자자 대신, 그가 정한 매매 규칙을 지키고 위험 단계에 맞춘 자동 투자를 관리하는 비서다.
-지금은 한국투자증권 '모의투자' 계좌로만 운영한다.
+계좌는 한국투자증권(모의투자 또는 실전)이다. get_safety_limits 의 broker 로 확인할 수 있다.
 
 ## 네가 하는 일
 1. 규칙 매매: 사용자의 말을 정형 규칙(종목·조건·수량·횟수)으로 바꾸고 propose_rules로 확인 카드를 띄운다.
@@ -30,8 +30,9 @@ SYSTEM_PROMPT = """너는 '장중대리'다. 회의로 바쁜 직장인 투자�
 
 ## 절대 규칙
 - 너는 주문을 내지 않는다. 주문은 시스템 엔진이 등록된 규칙과 고정된 전략대로만 낸다. "지금 바로 사 줘" 같은 즉시 주문 요청은 "조건 규칙으로 등록"하는 방법을 안내한다.
-- 종목을 추천하거나 고르지 않는다. 자동 투자 종목·비중은 시스템의 단계별 전략에 고정돼 있다. 시장 전망·투자 조언도 하지 않는다.
-- 국내 상장 주식·ETF만. 해외 직접투자, 선물·옵션, 레버리지·인버스 ETF는 거절한다. 초단타·고빈도 요청도 거절한다.
+- 대화에서 종목을 추천하거나 고르지 않는다. 자동 투자 종목·비중은 단계별 전략이 기본이고, 별도의 'AI 투자 점검'이 환율·경제지표를 보고 정해진 범위(기본 비중 ±조정 한도) 안에서만 조정한다. 사용자가 시장 상황·환율·전략을 물으면 get_ai_strategy 결과(최근 점검 요약, 국가별 판단, 환율)를 근거로 설명하고, 그 밖의 전망은 지어내지 않는다.
+- 국내 상장 주식·ETF가 기본이다. 해외 주식·ETF는 사용자가 설정에서 허용한 국가만 된다(get_safety_limits 의 overseas). search_stock 결과의 blocked 에 이유가 있으면 그대로 설명하고, 해외 투자를 켜거나 국가를 바꾸는 건 대시보드 설정 탭(해외 투자)에서 사용자가 직접 한다고 안내한다. 선물·옵션, 레버리지·인버스 상품은 국내·해외 모두 거절한다. 초단타·고빈도 요청도 거절한다.
+- 해외 종목의 가격 조건은 현지 통화(예: 애플은 달러)로 받는다. 금액(amount)은 항상 원화다. 사용자가 "애플 200달러 아래로 오면 100만원어치"라고 하면 threshold=200(달러), qty_value=1000000(원).
 - 추측 금지. 종목명이 모호하면 search_stock 결과 후보를 보여 주고 되묻는다(예: "삼성" → 삼성전자/삼성SDI/...). 수량·금액·조건 값이 빠졌으면 되묻는다.
 - 등록·변경·자동투자 시작·재개는 카드의 버튼을 사용자가 눌러야 확정된다. 도구가 카드를 보냈으면 "확인 카드를 보냈어요, 버튼으로 확정해 주세요"처럼 짧게 말한다. 네가 대신 확정했다고 말하지 않는다.
 - 도구가 errors를 돌려주면 그 내용을 사용자에게 쉽게 설명하고 필요한 정보를 묻는다.
@@ -44,7 +45,7 @@ SYSTEM_PROMPT = """너는 '장중대리'다. 회의로 바쁜 직장인 투자�
 - "삼성전자 6만5천원 이하로 내려오면 100만원어치 사 줘" → (buy, price_at_or_below, 65000, amount 1000000, 1회)
 - "네이버 22만원 넘으면 10주 팔아" → (sell, price_at_or_above, 220000, shares 10, 1회)
 - 횟수를 말하지 않으면 1회. "매번", "두 번까지"처럼 말하면 max_triggers에 반영(최대 10).
-- symbol은 반드시 search_stock으로 확인한 6자리 코드를 쓴다.
+- symbol은 반드시 search_stock으로 확인한 코드를 그대로 쓴다. 국내는 6자리(005930), 해외는 '거래소:티커'(NASD:AAPL, TKSE:7203).
 
 ## 말투
 텔레그램 메시지다. 짧은 평문 한국어, 마크다운 기호(**, #, 표)는 쓰지 않는다. 숫자는 1,000,000원처럼 쓴다.
@@ -53,12 +54,12 @@ SYSTEM_PROMPT = """너는 '장중대리'다. 회의로 바쁜 직장인 투자�
 RULE_ITEM = {
     "type": "object",
     "properties": {
-        "symbol": {"type": "string", "description": "search_stock으로 확인한 6자리 종목코드"},
+        "symbol": {"type": "string", "description": "search_stock으로 확인한 종목코드 (국내 6자리, 해외 NASD:AAPL 형식)"},
         "side": {"type": "string", "enum": ["buy", "sell"]},
         "condition": {"type": "string",
                       "enum": ["price_at_or_above", "price_at_or_below", "return_at_or_above", "return_at_or_below"],
-                      "description": "price_*: 현재가(원) 기준, return_*: 평균매입가 대비 수익률(%) 기준"},
-        "threshold": {"type": "number", "description": "가격(원) 또는 수익률(%). 손실은 음수(-7)"},
+                      "description": "price_*: 현재가 기준(국내 원, 해외 현지 통화), return_*: 평균매입가 대비 수익률(%) 기준"},
+        "threshold": {"type": "number", "description": "가격(국내 원, 해외 현지 통화) 또는 수익률(%). 손실은 음수(-7)"},
         "qty_mode": {"type": "string", "enum": ["shares", "fraction", "amount"],
                      "description": "shares=주수, fraction=보유 대비 비율(매도만, 0.5=절반, 1=전부), amount=금액(원, 매수만)"},
         "qty_value": {"type": "number"},
@@ -77,7 +78,7 @@ def _err(msg: str) -> dict:
 
 
 def build_tools(app) -> list:
-    @tool("search_stock", "종목명 또는 6자리 코드로 국내 종목을 찾는다. 후보가 여러 개면 사용자에게 되물어야 한다.",
+    @tool("search_stock", "종목명(한글·영문), 6자리 코드, 해외 티커로 종목을 찾는다. 해외는 허용 국가가 아니면 blocked 에 이유가 있다. 후보가 여러 개면 사용자에게 되물어야 한다.",
           {"query": str})
     async def search_stock(args):
         rows = app.universe.search(args["query"])
@@ -85,9 +86,10 @@ def build_tools(app) -> list:
 
     @tool("get_quote", "종목 현재가를 조회한다.", {"symbol": str})
     async def get_quote(args):
-        q = await app.broker.get_quote(args["symbol"])
+        sym = args["symbol"].upper() if ":" in args["symbol"] else args["symbol"]
+        q = await app.broker.get_quote(sym)
         return _ok({"symbol": q.symbol, "name": app.universe.name(q.symbol), "price": q.price,
-                    "prev_close": q.prev_close, "change_pct": q.change_pct, "halted": q.halted})
+                    "currency": q.currency, "prev_close": q.prev_close, "change_pct": q.change_pct, "halted": q.halted})
 
     @tool("get_account", "계좌 현금과 보유 종목(평균매입가, 수익률)을 조회한다. 자동투자 몫은 따로 표시한다.", {})
     async def get_account(args):
@@ -174,8 +176,23 @@ def build_tools(app) -> list:
 
     @tool("get_safety_limits", "현재 안전 한도와 전체 중지 상태.", {})
     async def get_safety_limits(args):
+        from . import markets
+        ov = app.settings.overseas
         return _ok({"limits": {k: v for k, v in app.settings.safety.items() if not k.startswith("_")},
+                    "broker": app.broker.name,
+                    "overseas": {"summary": markets.scope_text(ov),
+                                 "allowed_countries": [markets.COUNTRIES[c] for c in markets.COUNTRIES
+                                                       if c in markets.allowed_countries(ov)],
+                                 "kis_supported": list(markets.COUNTRIES.values())},
                     "halted": app.control.halted(), "suspended_symbols": app.control.suspended()})
+
+    @tool("get_ai_strategy", "최근 AI 투자 점검 결과(요약·국가별 판단·위험·목표 비중 변경·상태)와 현재 환율, AI 전략 설정을 조회한다.", {})
+    async def get_ai_strategy(args):
+        from . import macro
+        latest = app.strategist.latest()
+        return _ok({"settings": {k: v for k, v in app.settings.ai_strategy.items() if not k.startswith("_")},
+                    "latest": latest, "fx_krw": macro.fx_summary(app.db, app.settings.overseas),
+                    "fx_last_update": app.db.kv_get("fx_last")})
 
     @tool("emergency_stop", "모든 규칙 매매와 자동 투자를 즉시 중지한다.", {"reason": str})
     async def emergency_stop(args):
@@ -187,7 +204,7 @@ def build_tools(app) -> list:
 
     return [search_stock, get_quote, get_account, list_rules, propose_rules, propose_rule_change, get_risk_questions,
             score_risk_profile, propose_autoinvest, get_autoinvest_status, set_rebalance_mode, get_journal,
-            get_safety_limits, emergency_stop, request_resume]
+            get_safety_limits, get_ai_strategy, emergency_stop, request_resume]
 
 
 class Agent:

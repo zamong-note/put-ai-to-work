@@ -14,7 +14,7 @@ from . import timeutil
 from .audit import audit
 from .rules import rule_line
 
-SOURCE = {"rule": "규칙매매", "auto_build": "자동투자 구성", "rebalance": "리밸런싱"}
+SOURCE = {"rule": "규칙매매", "auto_build": "자동투자 구성", "rebalance": "리밸런싱", "ai_strategy": "AI 전략"}
 STATUS = {"filled": "체결", "partial": "부분체결", "submitted": "미체결", "failed": "실패", "rejected": "거부",
           "submitting": "접수중"}
 

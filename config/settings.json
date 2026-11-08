@@ -43,7 +43,35 @@
     "auto": "on",
     "summary": "on",
     "settings": "on",
-    "report": "on"
+    "report": "on",
+    "strategy": "on"
+  },
+  "overseas": {
+    "_comment": "해외 직접 투자 (규칙 매매). enabled off 면 국내만. scope: major3(미국·일본·중국) | all(KIS 지원 5개국) | custom(countries). 해외는 시장가가 없어 현재가 ± limit_slippage_pct 지정가로 주문. fx_* 는 안전 한도·금액 환산용 근사 환율.",
+    "enabled": "off",
+    "scope": "major3",
+    "countries": ["US"],
+    "limit_slippage_pct": 1.0,
+    "fx_auto": "on",
+    "fx_usd": 1400,
+    "fx_jpy100": 930,
+    "fx_cny": 195,
+    "fx_hkd": 180,
+    "fx_vnd100": 5.5
+  },
+  "ai_strategy": {
+    "_comment": "AI 전략 점검: 환율·경제지표·시장 흐름을 보고 자동 투자 목표 비중을 단계 기본값 ± max_tilt_pp 안에서 조정. mode: off | propose(제안 카드 → 실행 버튼) | auto(바로 실행 후 보고). cadence: daily | weekly(주 첫 거래일) | monthly(월 첫 거래일).",
+    "mode": "propose",
+    "cadence": "weekly",
+    "run_time": "10:30",
+    "max_tilt_pp": 10,
+    "max_turnover_pct": 20
+  },
+  "overseas_holidays": {
+    "_comment": "해외 시장 휴장일 (현지 날짜). 주말은 자동 제외. 비어 있는 나라는 휴장일에 주문이 거부될 수 있음.",
+    "US": ["2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03",
+           "2026-09-07", "2026-11-26", "2026-12-25"],
+    "JP": [], "CN": [], "HK": [], "VN": []
   },
   "sim": {
     "initial_cash": 11200000,

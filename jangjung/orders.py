@@ -10,7 +10,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 
-from . import timeutil
+from . import markets, timeutil
 from .broker.base import Broker, BrokerError, BrokerNetworkError
 from .control import Control
 from .db import DB
@@ -19,7 +19,7 @@ from .notify import Notifier
 from .universe import Universe
 
 log = logging.getLogger("jangjung")
-SOURCE_LABEL = {"rule": "규칙매매", "auto_build": "자동투자 구성", "rebalance": "리밸런싱"}
+SOURCE_LABEL = {"rule": "규칙매매", "auto_build": "자동투자 구성", "rebalance": "리밸런싱", "ai_strategy": "AI 전략"}
 
 
 @dataclass
@@ -89,7 +89,7 @@ class OrderGateway:
     # ── 한도 계산 ──
     def today_stats(self) -> tuple[int, float]:
         d = timeutil.today_str()
-        r = self.db.one("SELECT COUNT(*) n, COALESCE(SUM(CASE WHEN side='buy' THEN qty*decision_price END),0) b "
+        r = self.db.one("SELECT COUNT(*) n, COALESCE(SUM(CASE WHEN side='buy' THEN qty*decision_price*COALESCE(fx,1) END),0) b "
                         "FROM orders WHERE substr(created_at,1,10)=? AND status NOT IN ('failed','rejected')", (d,))
         return r["n"], r["b"]
 
@@ -127,7 +127,7 @@ class OrderGateway:
             return OrderOutcome("blocked", f"{it.symbol} 매매 일시중단 중: {self.control.suspended()[it.symbol]['reason']}")
         if why := self.universe.blocked_reason(it.symbol):
             return OrderOutcome("blocked", why)
-        if it.source in ("auto_build", "rebalance") and it.symbol not in self.universe.candidates:
+        if it.source in ("auto_build", "rebalance", "ai_strategy") and it.symbol not in self.universe.candidates:
             return OrderOutcome("blocked", "자동투자는 후보 목록 밖 종목을 살 수 없음")
         if it.qty <= 0 or it.side not in ("buy", "sell"):
             return OrderOutcome("blocked", "수량/방향 오류")
@@ -135,24 +135,31 @@ class OrderGateway:
             avail = await self.available_qty(it.symbol, it.bucket)
             if it.qty > avail:
                 return OrderOutcome("blocked", f"매도 가능 수량 부족 (요청 {it.qty}주, 가능 {avail}주)")
-        amount = it.qty * it.decision_price
+        ccy = markets.currency_of(it.symbol)
+        fx = markets.fx_rate(ccy, self.settings.overseas)
+        amount = it.qty * it.decision_price * fx                 # 안전 한도는 원화 기준
         issues = self.limit_issues(it.side, amount)
         if issues and not confirmed:
             return OrderOutcome("needs_confirm", "안전 한도 초과 — 확인 필요", issues=issues)
 
-        order_type = self.settings.engine.get("order_type", "market")
+        overseas = markets.is_overseas(it.symbol)
+        order_type = "limit" if overseas else self.settings.engine.get("order_type", "market")
+        if overseas:       # 해외는 시장가가 없어 현재가 ± 여유의 지정가
+            order_price = markets.limit_price(it.symbol, it.decision_price, it.side,
+                                              self.settings.overseas.get("limit_slippage_pct", 1.0))
+        else:
+            order_price = None if order_type == "market" else it.decision_price
         name = self.universe.name(it.symbol)
         now = timeutil.now().isoformat()
         evidence = dict(it.evidence, over_limit_confirmed=bool(issues) and confirmed, limit_issues=issues)
         oid = self.db.x(
             "INSERT INTO orders(created_at,detected_at,source,ref_id,bucket,symbol,name,side,qty,order_type,"
-            "decision_price,order_price,status,reason,evidence) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "decision_price,order_price,status,reason,evidence,currency,fx) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (now, it.detected_at, it.source, it.ref_id, it.bucket, it.symbol, name, it.side, it.qty, order_type,
-             it.decision_price, None if order_type == "market" else it.decision_price, "submitting", it.reason,
-             json.dumps(evidence, ensure_ascii=False)))
+             it.decision_price, order_price, "submitting", it.reason,
+             json.dumps(evidence, ensure_ascii=False), ccy, fx))
         try:
-            res = await self.broker.place_order(it.symbol, it.side, it.qty, order_type,
-                                                None if order_type == "market" else it.decision_price)
+            res = await self.broker.place_order(it.symbol, it.side, it.qty, order_type, order_price)
         except BrokerNetworkError as e:
             self.db.x("UPDATE orders SET status='failed', error=? WHERE id=?", (f"접수여부 불명: {e}", oid))
             self.control.halt(f"주문 #{oid} 통신 오류 — 접수 여부 불명, MTS 확인 필요", by="system")
@@ -216,8 +223,9 @@ class OrderGateway:
         await self.journal.log_order(o, SOURCE_LABEL.get(o["source"], o["source"]))
         side = "매수" if o["side"] == "buy" else "매도"
         if o["status"] == "filled":
-            txt = (f"[체결] {o['name']} {side} {o['filled_qty']}주 @ {o['avg_fill_price']:,.0f}원\n"
-                   f"근거: {o['reason']}\n판단 시세 {o['decision_price']:,.0f}원 · 주문번호 {o['broker_order_no']}")
+            fp = markets.fmt_price
+            txt = (f"[체결] {o['name']} {side} {o['filled_qty']}주 @ {fp(o['symbol'], o['avg_fill_price'])}\n"
+                   f"근거: {o['reason']}\n판단 시세 {fp(o['symbol'], o['decision_price'])} · 주문번호 {o['broker_order_no']}")
         else:
             txt = f"[주문 실패] {o['name']} {side} {o['qty']}주\n근거: {o['reason']}\n오류: {o['error']}"
         await self.notifier.send(txt, category="fill" if o["status"] == "filled" else None)
